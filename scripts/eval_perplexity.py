@@ -34,6 +34,7 @@ from src.training.data_pipeline import (
     get_step_ranges,
 )
 from src.model.commitment_head import CommitmentHead
+from src.model.summary_buffer import SummaryBuffer
 from src.model.cct_attention import build_cct_attention_mask_fast
 
 
@@ -224,7 +225,14 @@ def main():
     with open(args.config, encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using Apple Metal (MPS) backend")
+    else:
+        device = torch.device("cpu")
+        print("WARNING: No GPU found, evaluation on CPU (slow)")
     model_name = config["base_model"]
 
     # Load tokenizer
@@ -265,7 +273,8 @@ def main():
     print(f"\n  Baseline: loss={bl_loss:.4f}  ppl={bl_ppl:.2f}  ({bl_tokens} tokens, {bl_batches} batches)")
 
     del baseline_model
-    torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # ══════════════════════════════════════════════════════════
     # CONDITION 2: CCT (standard attention — weights-only test)
@@ -296,16 +305,26 @@ def main():
     print("CONDITION 3: CCT (CCT mask + summaries — deployment)")
     print("=" * 60)
 
-    # Load commitment head and up-projection
+    # Load commitment head and up-projection (match training config)
     commitment_head = CommitmentHead(
         d_model=config["d_model"],
         d_summary=config["d_summary"],
         d_bottleneck=config["d_bottleneck"],
+        use_tanh=config.get("use_tanh", True),
+        use_l2_norm=config.get("use_l2_norm", True),
+        noise_injection=config.get("noise_injection", False),
     ).to(device)
     commitment_head.load_state_dict(ckpt["commitment_head_state_dict"])
 
-    up_project = nn.Linear(config["d_summary"], config["d_model"], bias=False).to(device)
-    up_project.load_state_dict(ckpt["summary_up_project_state_dict"])
+    summary_buffer = SummaryBuffer(
+        d_summary=config["d_summary"],
+        d_model=config["d_model"],
+        device=device,
+        decoder_type=config.get("decoder_type", "linear"),
+        decoder_bottleneck=config.get("decoder_bottleneck", None),
+    )
+    summary_buffer.up_project.load_state_dict(ckpt["summary_up_project_state_dict"])
+    up_project = summary_buffer.up_project
 
     eval_loader3 = DataLoader(eval_dataset, batch_size=batch_size)
     cct_mask_loss, cct_mask_ppl, cct_mask_tokens, cct_mask_batches = compute_perplexity_cct_masked(
@@ -314,8 +333,9 @@ def main():
     )
     print(f"\n  CCT (masked): loss={cct_mask_loss:.4f}  ppl={cct_mask_ppl:.2f}  ({cct_mask_tokens} tokens, {cct_mask_batches} batches)")
 
-    del cct_model, commitment_head, up_project
-    torch.cuda.empty_cache()
+    del cct_model, commitment_head, up_project, summary_buffer
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # ══════════════════════════════════════════════════════════
     # COMPARISON

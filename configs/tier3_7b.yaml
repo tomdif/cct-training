@@ -1,0 +1,146 @@
+# Tier 3: Competitive Benchmark — 7B parameters
+# Estimated cost: $5,880 on 8× H100 80GB for ~350 hours
+# Goal: Head-to-head against Llama-8B, Mamba, RWKV at production scale
+# ONLY RUN IF TIER 2 PASSES ALL SUCCESS CRITERIA
+
+# ═══════════════════════════════════════
+# MODEL — Two paths
+# ═══════════════════════════════════════
+
+# PATH A: Fine-tune existing model (cheaper, tests F18 Claim 10)
+base_model: "meta-llama/Llama-3.1-8B"
+mode: "finetune"
+total_steps: 50000
+
+# PATH B: Train from scratch (stronger result, tests F18 Claim 1)
+# base_model: null
+# architecture: "llama"
+# mode: "scratch"
+# total_steps: 200000
+
+d_model: 4096
+n_layers: 32
+n_heads: 32
+
+# ═══════════════════════════════════════
+# CCT ARCHITECTURE
+# ═══════════════════════════════════════
+d_summary: 64
+d_bottleneck: 128
+step_length: 50
+step_boundary_mode: "semantic"
+summary_injection: "replace"
+
+# ═══════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════
+batch_size: 2
+seq_len: 2048              # 40 steps per sequence
+gradient_accumulation_steps: 8  # Effective batch 16
+learning_rate: 1.0e-5
+weight_decay: 0.01
+warmup_steps: 2000
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+mixed_precision: "bf16"
+
+# Distributed training
+distributed: true
+strategy: "fsdp"           # Or "deepspeed_zero3"
+
+# ═══════════════════════════════════════
+# CURRICULUM
+# ═══════════════════════════════════════
+curriculum:
+  phase1_end: 0.10
+  phase2_end: 0.50
+  phase3_end: 0.80
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+
+# ═══════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════
+dataset: "cerebras/SlimPajama-627B"
+dataset_streaming: true
+num_workers: 8
+
+# ═══════════════════════════════════════
+# EVALUATION (full suite)
+# ═══════════════════════════════════════
+eval_interval: 5000
+eval_tasks:
+  - sufficiency_probe
+  - compression_ratio
+  - lm_perplexity
+  - passkey_retrieval
+  - hellaswag
+  - arc_easy
+  - arc_challenge
+  - winogrande
+  - mmlu_5shot
+  - gsm8k
+  - truthfulqa_mc2
+  - ruler_niah         # Needle in a haystack (RULER)
+  - ruler_vt           # Variable tracking
+  - memory_profile     # Actual GPU memory at various context lengths
+
+passkey_context_lengths: [4096, 8192, 16384, 32768, 65536, 131072]
+memory_profile_lengths: [8192, 32768, 131072, 524288, 1048576]
+
+# ═══════════════════════════════════════
+# SUCCESS CRITERIA
+# ═══════════════════════════════════════
+success_criteria:
+  sufficiency_probe_r2: 0.92
+  perplexity_delta_pct: 0.03
+  compression_ratio_32k: 1000
+  compression_ratio_128k: 4000
+  passkey_accuracy_32k: 0.85
+  passkey_accuracy_128k: 0.70
+  mmlu_delta: 0.05
+
+# ═══════════════════════════════════════
+# COMPARISON MODELS
+# ═══════════════════════════════════════
+comparison_models:
+  - name: "llama-3.1-8b"
+    hf_id: "meta-llama/Llama-3.1-8B"
+  - name: "mamba-2.8b"
+    hf_id: "state-spaces/mamba-2.8b"
+  - name: "rwkv7-2.9b"
+    hf_id: "RWKV/rwkv-7-world-2.9b"
+  # Jamba if available at similar scale
+
+# ═══════════════════════════════════════
+# HARDWARE
+# ═══════════════════════════════════════
+gpu_count: 8
+gpu_type: "H100-80GB"
+seed: 42
+
+# ═══════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════
+wandb_project: "cct-training"
+wandb_name: "tier3-8b"
+save_interval: 5000
+results_dir: "./results"
+
+---
+# Tier 4: Frontier Demonstration — 13-70B parameters
+# Estimated cost: $67,200 on 32× H100 for ~1000 hours
+# This is the result that makes the portfolio worth $100M+
+# 
+# Config is same structure as Tier 3 with:
+# base_model: "meta-llama/Llama-3.1-70B" (fine-tune path)
+# d_summary: 128
+# gpu_count: 64
+# strategy: "deepspeed_zero3"
+# 
+# Do not plan this in detail until Tier 3 results are in hand.

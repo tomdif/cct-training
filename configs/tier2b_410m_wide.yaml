@@ -1,0 +1,121 @@
+# Tier 2B: Wide Bottleneck — 410M parameters
+# Hardware: 1x RTX 4060 Ti 16GB
+# Goal: Test whether d_summary=128 closes the +71% perplexity gap
+#
+# Key change from Tier 2:
+#   d_summary: 32 → 128 (4× wider, still ~20× compression at 4K)
+#   d_bottleneck: 64 → 256 (scaled 2× with d_summary)
+
+# ═══════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304  # Pythia tokenizer + STEP token
+
+# ═══════════════════════════════════════
+# CCT ARCHITECTURE
+# ═══════════════════════════════════════
+d_summary: 128             # 4× wider than Tier 2
+d_bottleneck: 256           # 2× d_summary
+step_length: 50
+step_boundary_mode: "fixed"
+
+summary_injection: "replace"
+
+# ═══════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════
+mode: "finetune"
+total_steps: 50000
+batch_size: 4
+seq_len: 512
+gradient_accumulation_steps: 2  # Effective batch = 8
+
+# Optimizer
+optimizer: "adamw"
+learning_rate: 3.0e-5
+weight_decay: 0.01
+warmup_steps: 1000
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+# Precision
+mixed_precision: "bf16"
+
+# ═══════════════════════════════════════
+# CURRICULUM (same as Tier 2)
+# ═══════════════════════════════════════
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.30
+  phase3_end: 0.60
+
+# Loss weights
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+  delta_start: 0.1
+
+# ═══════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# ═══════════════════════════════════════
+# EVALUATION
+# ═══════════════════════════════════════
+eval_interval: 5000
+eval_steps: 200
+
+eval_tasks:
+  - sufficiency_probe
+  - compression_ratio
+  - lm_perplexity
+  - passkey_retrieval
+
+passkey_context_lengths: [512, 1024, 2048, 4096]
+
+# ═══════════════════════════════════════
+# SUCCESS CRITERIA
+# ═══════════════════════════════════════
+success_criteria:
+  sufficiency_probe_r2: 0.85
+  perplexity_delta_pct: 0.10
+  compression_ratio_4k: 20
+  passkey_accuracy_1k: 0.90
+  passkey_accuracy_4k: 0.70
+
+# ═══════════════════════════════════════
+# BASELINE (reuse Tier 2 baseline — same model, same data)
+# ═══════════════════════════════════════
+train_baseline: false
+baseline_steps: 50000
+
+# ═══════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════
+wandb_project: "cct-training"
+wandb_name: "tier2b-410m-wide"
+log_interval: 100
+save_interval: 10000
+save_dir: "./checkpoints-tier2b"
+results_dir: "./results-tier2b"
+
+# ═══════════════════════════════════════
+# HARDWARE
+# ═══════════════════════════════════════
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

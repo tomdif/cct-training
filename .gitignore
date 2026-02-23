@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+checkpoints/
+checkpoints-tier2/
+checkpoints-tier2b/
+wandb/
+*.pt
+*.safetensors
+*.bin
+*.h5
+.DS_Store
+nohup.out
+results/
+results-tier2/
+results-tier2b/

@@ -1,0 +1,124 @@
+# Tier 2: Scaling Validation — 410M parameters
+# Hardware: 1x RTX 4060 Ti 16GB
+# Goal: Hit R² > 0.85 with wider bottleneck and front-loaded delta
+#
+# Key changes from Tier 1:
+#   1. d_summary: 16 → 32 (wider bottleneck, still ~2400× compression at 4K)
+#   2. delta_start: 0.1 (commitment head trains from step 0)
+#   3. phase1_end: 0.0 (no wasted awareness phase)
+#   4. Faster curriculum ramp (Phase 4 starts at 60%)
+
+# ═══════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304  # Pythia tokenizer + STEP token
+
+# ═══════════════════════════════════════
+# CCT ARCHITECTURE
+# ═══════════════════════════════════════
+d_summary: 32              # Doubled from Tier 1's 16
+d_bottleneck: 64           # Scaled with d_summary (2× bottleneck)
+step_length: 50            # Same as Tier 1
+step_boundary_mode: "fixed"
+
+summary_injection: "replace"
+
+# ═══════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════
+mode: "finetune"
+total_steps: 50000
+batch_size: 4              # Reduced from 8 for VRAM
+seq_len: 512
+gradient_accumulation_steps: 2  # Effective batch = 8
+
+# Optimizer
+optimizer: "adamw"
+learning_rate: 3.0e-5      # Slightly lower for larger model
+weight_decay: 0.01
+warmup_steps: 1000
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+# Precision
+mixed_precision: "bf16"
+
+# ═══════════════════════════════════════
+# CURRICULUM (front-loaded)
+# ═══════════════════════════════════════
+curriculum:
+  phase1_end: 0.0    # No awareness phase — start CCT immediately
+  phase2_end: 0.30   # Stochastic: p_commit 0.1 → 0.5 (steps 0-15K)
+  phase3_end: 0.60   # Majority: p_commit 0.5 → 0.9 (steps 15K-30K)
+  # Phase 4: Full commitment from step 30K onward (40% of training)
+
+# Loss weights
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+  delta_start: 0.1   # Front-loaded: commitment head trains from step 0
+
+# ═══════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# ═══════════════════════════════════════
+# EVALUATION
+# ═══════════════════════════════════════
+eval_interval: 5000
+eval_steps: 200
+
+eval_tasks:
+  - sufficiency_probe
+  - compression_ratio
+  - lm_perplexity
+  - passkey_retrieval
+
+passkey_context_lengths: [512, 1024, 2048, 4096]
+
+# ═══════════════════════════════════════
+# SUCCESS CRITERIA
+# ═══════════════════════════════════════
+success_criteria:
+  sufficiency_probe_r2: 0.85
+  perplexity_delta_pct: 0.10
+  compression_ratio_4k: 50
+  passkey_accuracy_1k: 0.90
+  passkey_accuracy_4k: 0.70
+
+# ═══════════════════════════════════════
+# BASELINE
+# ═══════════════════════════════════════
+train_baseline: true
+baseline_steps: 50000
+
+# ═══════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════
+wandb_project: "cct-training"
+wandb_name: "tier2-410m"
+log_interval: 100
+save_interval: 10000
+save_dir: "./checkpoints-tier2"
+results_dir: "./results-tier2"
+
+# ═══════════════════════════════════════
+# HARDWARE
+# ═══════════════════════════════════════
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

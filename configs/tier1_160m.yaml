@@ -1,0 +1,128 @@
+# Tier 1: Proof of Concept — 160M parameters
+# Estimated cost: $62 on 1× A100 80GB for ~48 hours
+# Goal: Prove CCT architecture works on a real transformer
+
+# ═══════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════
+base_model: "EleutherAI/pythia-160m-deduped"
+d_model: 768
+n_layers: 12
+n_heads: 12
+vocab_size: 50304  # Pythia tokenizer + STEP token
+
+# ═══════════════════════════════════════
+# CCT ARCHITECTURE
+# ═══════════════════════════════════════
+d_summary: 16              # Commitment summary dimension
+d_bottleneck: 32           # Intermediate bottleneck in commitment head
+step_length: 50            # Fixed token count per step
+step_boundary_mode: "fixed"  # "fixed" | "semantic"
+
+# Summary injection strategy
+# "replace": Replace STEP token hidden state with computed summary (simpler)
+# "prepend": Prepend summary embeddings to next step's input (cleaner)
+summary_injection: "replace"
+
+# ═══════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════
+mode: "finetune"           # "finetune" | "scratch"
+total_steps: 50000
+batch_size: 8
+seq_len: 512               # = ~10 steps of 50 tokens per sequence
+gradient_accumulation_steps: 1
+
+# Optimizer
+optimizer: "adamw"
+learning_rate: 5.0e-5
+weight_decay: 0.01
+warmup_steps: 1000
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+# Precision
+mixed_precision: "bf16"    # "fp16" | "bf16" | "fp32"
+
+# ═══════════════════════════════════════
+# CURRICULUM (4 phases)
+# ═══════════════════════════════════════
+curriculum:
+  # Phase boundaries as fraction of total_steps
+  phase1_end: 0.10   # Awareness: no commitment enforcement
+  phase2_end: 0.50   # Stochastic: p_commit 0.1 → 0.5
+  phase3_end: 0.80   # Majority: p_commit 0.5 → 0.9
+  # Phase 4: Full commitment (0.80 → 1.00): p_commit = 1.0
+
+# Loss weights (initial values, curriculum scales them)
+loss_weights:
+  alpha_start: 1.0   # Standard LM loss (decreases to 0.5)
+  alpha_end: 0.5
+  beta_max: 0.5      # Per-step validity loss
+  gamma_max: 0.3     # Conclusion-from-premises loss
+  delta_max: 0.2     # Sufficiency probe loss
+
+# ═══════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# ═══════════════════════════════════════
+# EVALUATION
+# ═══════════════════════════════════════
+eval_interval: 5000        # Run eval every N steps
+eval_steps: 200            # Number of eval batches
+
+eval_tasks:
+  - sufficiency_probe      # Linear probe R²
+  - compression_ratio      # Memory measurement
+  - lm_perplexity          # Held-out perplexity
+  - passkey_retrieval      # Long-range recall
+
+passkey_context_lengths: [512, 1024, 2048, 4096]
+
+# ═══════════════════════════════════════
+# SUCCESS CRITERIA
+# ═══════════════════════════════════════
+success_criteria:
+  sufficiency_probe_r2: 0.85
+  perplexity_delta_pct: 0.10   # Max 10% worse than baseline
+  compression_ratio_4k: 50     # Min 50× at 4K context
+  passkey_accuracy_1k: 0.90    # Min 90% at 1K context
+  passkey_accuracy_4k: 0.70    # Min 70% at 4K context
+
+# ═══════════════════════════════════════
+# BASELINE
+# ═══════════════════════════════════════
+train_baseline: true           # Also train without CCT for comparison
+baseline_steps: 50000          # Same number of steps
+
+# ═══════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════
+wandb_project: "cct-training"
+wandb_name: "tier1-160m"
+log_interval: 100              # Log every N steps
+save_interval: 10000           # Checkpoint every N steps
+save_dir: "./checkpoints"
+results_dir: "./results"
+
+# ═══════════════════════════════════════
+# HARDWARE
+# ═══════════════════════════════════════
+gpu_count: 1
+gpu_type: "A100-80GB"          # For documentation
+seed: 42
+deterministic: true
+
+# ═══════════════════════════════════════
+# STEP LENGTH SWEEP (Tier 1 extra)
+# ═══════════════════════════════════════
+# After the main run, sweep step lengths to find the sweet spot
+step_length_sweep: [25, 50, 100]
+sweep_steps: 10000             # Shorter training per sweep config

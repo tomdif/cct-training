@@ -1,0 +1,137 @@
+# Tier 2: Small-Scale Validation — 1.3B parameters
+# Estimated cost: $315 on 1× H100 80GB for ~150 hours
+# Goal: Publishable result demonstrating CCT at meaningful scale
+# ONLY RUN IF TIER 1 PASSES ALL SUCCESS CRITERIA
+
+# ═══════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════
+base_model: "EleutherAI/pythia-1.4b-deduped"
+# Alternative: "meta-llama/Llama-3.2-1B" (stronger base, gated access)
+d_model: 2048
+n_layers: 24
+n_heads: 16
+vocab_size: 50304  # Will be extended with STEP token
+
+# ═══════════════════════════════════════
+# CCT ARCHITECTURE
+# ═══════════════════════════════════════
+d_summary: 32              # Larger model → slightly larger summary
+d_bottleneck: 64
+step_length: 50
+step_boundary_mode: "semantic"  # Upgrade from fixed to semantic detection
+
+# Use optimal step_length from Tier 1 sweep if different from 50
+# step_length: ${TIER1_OPTIMAL_STEP_LENGTH}
+
+summary_injection: "replace"
+
+# ═══════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════
+mode: "finetune"
+total_steps: 100000         # ~100M tokens
+batch_size: 4               # Reduced for 1.4B model memory
+seq_len: 1024               # = ~20 steps per sequence
+gradient_accumulation_steps: 2  # Effective batch size = 8
+
+optimizer: "adamw"
+learning_rate: 2.0e-5       # Lower LR for larger model
+weight_decay: 0.01
+warmup_steps: 2000
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+mixed_precision: "bf16"
+
+# ═══════════════════════════════════════
+# CURRICULUM (same phases, tuned from Tier 1)
+# ═══════════════════════════════════════
+curriculum:
+  phase1_end: 0.10
+  phase2_end: 0.50
+  phase3_end: 0.80
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+
+# ═══════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════
+dataset: "cerebras/SlimPajama-627B"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "cerebras/SlimPajama-627B"
+validation_split: "validation"
+num_workers: 4
+
+# ═══════════════════════════════════════
+# EVALUATION (expanded for Tier 2)
+# ═══════════════════════════════════════
+eval_interval: 5000
+eval_steps: 500
+
+eval_tasks:
+  - sufficiency_probe
+  - compression_ratio
+  - lm_perplexity
+  - passkey_retrieval
+  - hellaswag
+  - arc_easy
+  - arc_challenge
+  - winogrande
+
+passkey_context_lengths: [512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+# ═══════════════════════════════════════
+# SUCCESS CRITERIA (higher bar)
+# ═══════════════════════════════════════
+success_criteria:
+  sufficiency_probe_r2: 0.90
+  perplexity_delta_pct: 0.05   # Max 5% worse
+  compression_ratio_8k: 200
+  compression_ratio_32k: 1000
+  passkey_accuracy_8k: 0.85
+  passkey_accuracy_32k: 0.60
+  hellaswag_delta: 0.05        # Within 5% of baseline
+
+# ═══════════════════════════════════════
+# COMPARISON MODELS (download/eval these too)
+# ═══════════════════════════════════════
+comparison_models:
+  - name: "pythia-1.4b-baseline"
+    path: "./checkpoints/baseline-1.4b"
+    description: "Same model, standard training (no CCT)"
+  - name: "mamba-1.4b"
+    hf_id: "state-spaces/mamba-1.4b"
+    description: "Mamba SSM at similar scale"
+  # RWKV-7 at 1.5B if weights available
+  # - name: "rwkv7-1.5b"
+  #   hf_id: "RWKV/rwkv-7-1.5b-world"
+
+# ═══════════════════════════════════════
+# BASELINE
+# ═══════════════════════════════════════
+train_baseline: true
+baseline_steps: 100000
+
+# ═══════════════════════════════════════
+# LOGGING & CHECKPOINTING
+# ═══════════════════════════════════════
+wandb_project: "cct-training"
+wandb_name: "tier2-1.4b"
+log_interval: 100
+save_interval: 10000
+save_dir: "./checkpoints"
+results_dir: "./results"
+
+# ═══════════════════════════════════════
+# HARDWARE
+# ═══════════════════════════════════════
+gpu_count: 1
+gpu_type: "H100-80GB"
+seed: 42
+deterministic: true

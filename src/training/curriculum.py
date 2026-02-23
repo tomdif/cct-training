@@ -10,12 +10,17 @@ Phase 2 (10-50%):  Stochastic — p_commit linearly 0.1 -> 0.5
 Phase 3 (50-80%):  Majority — p_commit linearly 0.5 -> 0.9
 Phase 4 (80-100%): Full — p_commit = 1.0
 
+Noise annealing (optional): σ decreases over training, increasing the
+information channel capacity through the commitment bottleneck.
+  Early: high σ → low bitrate → model encodes only critical info
+  Late:  low σ → high bitrate → model encodes everything it needs
+
 See CCT_IMPLEMENTATION_GUIDE.md Section 1.5.
 """
 
 
 class CommitmentCurriculum:
-    """Schedules commitment probability and loss weights across training."""
+    """Schedules commitment probability, loss weights, and noise level."""
 
     def __init__(
         self,
@@ -24,12 +29,16 @@ class CommitmentCurriculum:
         phase2_end: float = 0.50,
         phase3_end: float = 0.80,
         delta_start: float = 0.0,
+        noise_sigma_start: float = 0.0,
+        noise_sigma_end: float = 0.0,
     ):
         self.total = total_steps
         self.p1 = phase1_end
         self.p2 = phase2_end
         self.p3 = phase3_end
         self.delta_start = delta_start
+        self.noise_sigma_start = noise_sigma_start
+        self.noise_sigma_end = noise_sigma_end
 
     def get_commitment_probability(self, current_step: int) -> float:
         """Returns p_commit for current training step."""
@@ -82,3 +91,14 @@ class CommitmentCurriculum:
             return 3
         else:
             return 4
+
+    def get_noise_sigma(self, current_step: int) -> float:
+        """Returns noise injection σ for current training step.
+
+        Anneals linearly from noise_sigma_start to noise_sigma_end.
+        Returns 0.0 if noise injection is not configured.
+        """
+        if self.noise_sigma_start == 0.0 and self.noise_sigma_end == 0.0:
+            return 0.0
+        progress = current_step / self.total
+        return self.noise_sigma_start + (self.noise_sigma_end - self.noise_sigma_start) * progress

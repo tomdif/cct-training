@@ -85,9 +85,12 @@ def train(args):
     # Device
     if torch.cuda.is_available():
         device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+        print("Using Apple Metal (MPS) backend")
     else:
         device = "cpu"
-        print("WARNING: No CUDA device found, training on CPU (very slow)")
+        print("WARNING: No GPU found, training on CPU (very slow)")
 
     # Load tokenizer and model
     model_name = config_dict["base_model"]
@@ -96,10 +99,12 @@ def train(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # bf16 on CUDA, float32 on MPS/CPU (MPS has limited bf16 support)
+    model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         attn_implementation="eager",  # Required for custom attention masks
-        dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        torch_dtype=model_dtype,
     ).to(device)
 
     # Extend tokenizer with STEP token
@@ -134,6 +139,15 @@ def _train_cct(model, tokenizer, step_token_id, config_dict, device):
         phase2_end=config_dict["curriculum"]["phase2_end"],
         phase3_end=config_dict["curriculum"]["phase3_end"],
         delta_start=config_dict.get("loss_weights", {}).get("delta_start", 0.0),
+        # Commitment head options
+        use_tanh=config_dict.get("use_tanh", True),
+        use_l2_norm=config_dict.get("use_l2_norm", True),
+        noise_injection=config_dict.get("noise_injection", False),
+        noise_sigma_start=config_dict.get("noise_sigma_start", 0.0),
+        noise_sigma_end=config_dict.get("noise_sigma_end", 0.0),
+        # Decoder options
+        decoder_type=config_dict.get("decoder_type", "linear"),
+        decoder_bottleneck=config_dict.get("decoder_bottleneck", None),
         eval_interval=config_dict.get("eval_interval", 5000),
         log_interval=config_dict.get("log_interval", 100),
         device=device,

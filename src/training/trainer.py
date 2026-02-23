@@ -69,6 +69,17 @@ class TrainConfig:
     phase3_end: float = 0.80
     delta_start: float = 0.0
 
+    # Commitment head options
+    use_tanh: bool = True
+    use_l2_norm: bool = True
+    noise_injection: bool = False
+    noise_sigma_start: float = 0.0
+    noise_sigma_end: float = 0.0
+
+    # Decoder options
+    decoder_type: str = "linear"
+    decoder_bottleneck: int | None = None
+
     # Evaluation
     eval_interval: int = 5000
     log_interval: int = 100
@@ -104,6 +115,9 @@ class CCTTrainer:
             d_model=config.d_model,
             d_summary=config.d_summary,
             d_bottleneck=config.d_bottleneck,
+            use_tanh=config.use_tanh,
+            use_l2_norm=config.use_l2_norm,
+            noise_injection=config.noise_injection,
         ).to(self.device)
 
         self.sufficiency_probe = SufficiencyProbe(
@@ -115,6 +129,8 @@ class CCTTrainer:
             d_summary=config.d_summary,
             d_model=config.d_model,
             device=self.device,
+            decoder_type=config.decoder_type,
+            decoder_bottleneck=config.decoder_bottleneck,
         )
 
         self.curriculum = CommitmentCurriculum(
@@ -123,6 +139,8 @@ class CCTTrainer:
             phase2_end=config.phase2_end,
             phase3_end=config.phase3_end,
             delta_start=config.delta_start,
+            noise_sigma_start=config.noise_sigma_start,
+            noise_sigma_end=config.noise_sigma_end,
         )
 
         # Optimizer — includes commitment head and sufficiency probe params
@@ -152,6 +170,9 @@ class CCTTrainer:
             return torch.autocast("cuda", dtype=torch.bfloat16)
         elif self.config.mixed_precision == "fp16" and self.device.type == "cuda":
             return torch.autocast("cuda", dtype=torch.float16)
+        elif self.device.type == "mps":
+            # MPS: no autocast, use float32
+            return torch.autocast("cpu", enabled=False)
         else:
             return torch.autocast(self.device.type, enabled=False)
 
@@ -182,6 +203,12 @@ class CCTTrainer:
         commit_this_step = (torch.rand(1).item() < p_commit)
         if not commit_this_step:
             return self._standard_train_step(input_ids, weights)
+
+        # Update noise sigma from curriculum
+        if self.config.noise_injection:
+            self.commitment_head.noise_sigma = self.curriculum.get_noise_sigma(
+                self.global_step
+            )
 
         # Full CCT training step
         return self._cct_train_step(input_ids, weights)

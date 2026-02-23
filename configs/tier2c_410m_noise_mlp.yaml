@@ -1,0 +1,128 @@
+# Tier 2C: Noise Injection + MLP Decoder — 410M parameters
+# Hardware: Apple M3 Max (MPS) or CUDA GPU
+# Goal: Test whether better regularization + decoder closes the +71% gap
+#        at d_summary=32 (without widening the bottleneck)
+#
+# Key changes from Tier 2:
+#   1. Remove Tanh + L2 norm from commitment head
+#   2. Add noise injection (σ anneals 0.5 → 0.1 over training)
+#   3. Replace linear up_project with 2-layer MLP (32 → 256 → 1024, GELU)
+#   4. d_summary stays at 32 (same compression ratio as Tier 2)
+
+# ═══════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# ═══════════════════════════════════════
+# CCT ARCHITECTURE
+# ═══════════════════════════════════════
+d_summary: 32              # Same as Tier 2 — testing architecture, not width
+d_bottleneck: 64
+step_length: 50
+step_boundary_mode: "fixed"
+
+summary_injection: "replace"
+
+# Commitment head: no Tanh, no L2 norm, noise injection
+use_tanh: false
+use_l2_norm: false
+noise_injection: true
+noise_sigma_start: 0.5     # High noise early → low bitrate → encode only critical info
+noise_sigma_end: 0.1       # Low noise late → high bitrate → encode everything needed
+
+# Decoder: MLP instead of linear
+decoder_type: "mlp"
+decoder_bottleneck: 256     # 32 → 256 → 1024
+
+# ═══════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════
+mode: "finetune"
+total_steps: 50000
+batch_size: 4
+seq_len: 512
+gradient_accumulation_steps: 2
+
+optimizer: "adamw"
+learning_rate: 3.0e-5
+weight_decay: 0.01
+warmup_steps: 1000
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"     # Ignored on MPS, uses float32 automatically
+
+# ═══════════════════════════════════════
+# CURRICULUM (same as Tier 2)
+# ═══════════════════════════════════════
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.30
+  phase3_end: 0.60
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+  delta_start: 0.1
+
+# ═══════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# ═══════════════════════════════════════
+# EVALUATION
+# ═══════════════════════════════════════
+eval_interval: 5000
+eval_steps: 200
+
+eval_tasks:
+  - sufficiency_probe
+  - compression_ratio
+  - lm_perplexity
+  - passkey_retrieval
+
+passkey_context_lengths: [512, 1024, 2048, 4096]
+
+success_criteria:
+  sufficiency_probe_r2: 0.85
+  perplexity_delta_pct: 0.10
+  compression_ratio_4k: 50
+  passkey_accuracy_1k: 0.90
+  passkey_accuracy_4k: 0.70
+
+# ═══════════════════════════════════════
+# BASELINE (reuse Tier 2 baseline)
+# ═══════════════════════════════════════
+train_baseline: false
+
+# ═══════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════
+wandb_project: "cct-training"
+wandb_name: "tier2c-noise-mlp"
+log_interval: 100
+save_interval: 10000
+save_dir: "./checkpoints-tier2c"
+results_dir: "./results-tier2c"
+
+# ═══════════════════════════════════════
+# HARDWARE
+# ═══════════════════════════════════════
+gpu_count: 1
+gpu_type: "M3-Max"
+seed: 42
+deterministic: true

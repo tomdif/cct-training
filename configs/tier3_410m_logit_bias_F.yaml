@@ -1,0 +1,124 @@
+# Tier 3: Logit Bias + Strong L_con (Config F: definitive experiment)
+# Hardware: 1x RTX 4060 Ti 16GB
+#
+# The ONLY delivery mechanism that showed positive summary benefit was logit bias:
+#   Prior run (frozen_logit_bias): +0.44 PPL step 1, +0.66 step 2
+#   But deployment delta was +16.4% (bias shifts poorly calibrated)
+#
+# Root cause of prior delta: commitment head trained with weak L_con signal
+# (10 tokens, gamma=0.3, L_suf dominated). The commitment head learned
+# hidden-state compression (L_suf objective) not predictive encoding (L_con).
+# Poor summaries → poor logit bias shifts → high deployment delta.
+#
+# This run applies the improved commitment head training regime:
+#   - conclusion_n_tokens: 10 → 200 (20x more L_con gradient)
+#   - delta_taper: true (L_suf anneals to 0, L_con becomes sole signal)
+#   - gamma_max: 0.35 (moderate but 20x effective signal from 200 tokens)
+#   - step_length: 200 → 400 (longer steps, harder task, more gradient)
+#
+# Why logit bias works: gradient flows L_con → logits → logit_bias(summaries)
+# → commitment_head. DIRECT path — no 24 transformer layers to traverse.
+# This is why it was the only mechanism showing positive benefit.
+#
+# Success criteria:
+#   - Summary benefit > +0.5 PPL at step 1 (matching or beating prior)
+#   - Deployment delta < 10% (down from +16.4%)
+#   - If both: the commitment head training was the bottleneck all along
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — no constraints
+use_tanh: false
+use_l2_norm: false
+
+# L_conclusion — 200 tokens, the key improvement
+conclusion_n_tokens: 200
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# FROZEN MODEL + LOGIT BIAS
+freeze_base_model: true
+summary_logit_bias: true
+logit_bias_hidden_dim: 256
+
+# No other delivery mechanisms
+use_kv_prefix: false
+summary_adapter: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 20000
+batch_size: 2
+seq_len: 1024
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 5.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# CURRICULUM — skip phase 1, shorter commitment regime
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier3-logit-bias-F-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-logit-bias-F"
+results_dir: "./results-tier3-logit-bias-F"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

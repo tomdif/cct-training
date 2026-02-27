@@ -1,0 +1,122 @@
+# Tier 3: GRU Recurrent Commitment Head (Config J)
+# Hardware: 1x RTX 4060 Ti 16GB
+#
+# Run I showed additive fusion gate settled at 0.17 and summary benefit
+# was flat at +0.17 PPL across all steps 1-10. The simple additive gate
+# lacks update/reset dynamics needed for selective long-range retention.
+#
+# Fix: Replace additive gate with nn.GRUCell(128, 128).
+#   - GRU update gate: selectively retains previous hidden state
+#   - GRU reset gate: selectively forgets before computing candidate
+#   - Candidate gate: integrates new step information
+#   - Hidden state = prev_summary (128-dim, L2-normalized)
+#   - Input = bottleneck activation projected to 128-dim
+#
+# Everything else identical to Run I: last-summary-only delivery,
+# frozen base, logit bias, 30% synthetic data, seq_len=4096.
+#
+# Success criterion: summary benefit grows with step distance.
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — GRU recurrent
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: true
+last_summary_only: true
+
+# L_conclusion — 200 tokens, proven regime
+conclusion_n_tokens: 200
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# FROZEN MODEL + LOGIT BIAS
+freeze_base_model: true
+summary_logit_bias: true
+logit_bias_hidden_dim: 256
+
+# No other delivery mechanisms
+use_kv_prefix: false
+summary_adapter: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 20000
+batch_size: 1
+seq_len: 4096
+gradient_accumulation_steps: 8
+
+optimizer: "adamw"
+learning_rate: 5.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# CURRICULUM — skip phase 1, shorter commitment regime
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.05
+
+# SYNTHETIC DATA — 30% mix of cross-step repetition sequences
+synthetic_data_ratio: 0.3
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier3-recurrent-J-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-recurrent-J"
+results_dir: "./results-tier3-recurrent-J"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

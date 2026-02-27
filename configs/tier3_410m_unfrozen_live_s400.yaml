@@ -1,0 +1,102 @@
+# Tier 3 Unfrozen Model + Live Gradient + step_length=400
+# Hardware: 1x RTX 4060 Ti 16GB
+#
+# Key combination never tested before:
+# 1. Live-gradient routing: L_con flows through commitment head (predictive signal)
+# 2. Unfrozen base model: model can learn to READ summaries via native attention
+# 3. step_length=400: minimal mask cost, fewer boundaries = less weight damage
+#
+# Previous results:
+# - Frozen+logit_bias+live: summary benefit +0.31 PPL (6% recovery) — summaries useful but can't be read
+# - Unfrozen+detached+s200: high mask cost, useless summaries
+# - This run combines fixes for BOTH problems
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — no constraints, let it learn freely
+use_tanh: false
+use_l2_norm: false
+
+# L_conclusion — live gradient to commitment head
+conclusion_n_tokens: 10
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# UNFROZEN BASE MODEL — native attention reads summaries
+freeze_base_model: false
+summary_adapter: false
+summary_logit_bias: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 20000
+batch_size: 1
+seq_len: 1024
+gradient_accumulation_steps: 8
+
+optimizer: "adamw"
+learning_rate: 2.0e-5
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# CURRICULUM — skip phase 1, ramp faster
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.50
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+  delta_start: 0.1
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier3-unfrozen-live-s400-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-unfrozen-live-s400"
+results_dir: "./results-tier3-unfrozen-live-s400"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

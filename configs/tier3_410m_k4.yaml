@@ -1,0 +1,121 @@
+# Tier 3: K=4 Summary Tokens — 410M parameters
+# Purpose: 4x attention surface area (4 tokens vs 200, not 1 vs 200)
+#
+# Changes from tier3_410m_seq_s200.yaml:
+#   1. n_summary_tokens: 4 (was 1)
+#   2. d_bottleneck: 1024 (was 256) — avoids K=4 redundancy
+#      (256-dim bottleneck made all 4 tokens identical at 160M)
+#
+# No attention bias, no L_conclusion — clean structural test.
+
+# ═══════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# ═══════════════════════════════════════
+# CCT ARCHITECTURE
+# ═══════════════════════════════════════
+d_summary: 128
+d_bottleneck: 1024
+n_summary_tokens: 4
+step_length: 200
+step_boundary_mode: "fixed"
+
+# Sequential training mode
+training_mode: "sequential"
+
+# Full detach required for memory-efficient per-step backward
+gradient_isolation: "full_detach"
+
+# Commitment head: no Tanh, no L2 norm
+use_tanh: false
+use_l2_norm: false
+
+# L_conclusion active
+conclusion_n_tokens: 10
+
+# Decoder: MLP
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# ═══════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════
+mode: "finetune"
+total_steps: 20000
+batch_size: 2
+seq_len: 512
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 2.0e-5
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# ═══════════════════════════════════════
+# CURRICULUM
+# ═══════════════════════════════════════
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.50
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+  delta_start: 0.1
+
+# ═══════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# ═══════════════════════════════════════
+# EVALUATION
+# ═══════════════════════════════════════
+eval_interval: 2000
+eval_steps: 100
+
+eval_tasks:
+  - sufficiency_probe
+  - compression_ratio
+  - lm_perplexity
+
+success_criteria:
+  sufficiency_probe_r2: 0.85
+  perplexity_delta_pct: 0.10
+
+# ═══════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════
+wandb_project: "cct-training"
+wandb_name: "tier3-k4-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-k4"
+results_dir: "./results-tier3-k4"
+
+# ═══════════════════════════════════════
+# HARDWARE
+# ═══════════════════════════════════════
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

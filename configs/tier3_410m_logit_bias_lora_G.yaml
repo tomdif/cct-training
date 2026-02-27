@@ -1,0 +1,127 @@
+# Tier 3: Logit Bias + LoRA (Config G: the combination run)
+# Hardware: 1x RTX 4060 Ti 16GB
+#
+# Combines two independently validated mechanisms:
+#   1. Logit bias: the ONLY delivery mechanism with positive summary benefit
+#      Run F showed: +0.51 PPL step 1, +0.60 step 2, strictly reduces delta
+#   2. LoRA: reduces CCT mask cost from +12% (frozen) to ~3% (adapted)
+#      Prior LoRA-only run: +3.17% weights-only delta
+#
+# They address different problems and shouldn't conflict:
+#   - LoRA adapts attention to handle truncated context (reduces mask cost)
+#   - Logit bias delivers cross-step information via summary-derived shifts
+#
+# Expected outcome: ~2-3% deployment delta with +0.5-0.6 PPL summary benefit
+#
+# Uses the proven commitment head training regime from Run F:
+#   - 200 conclusion tokens (20x L_con gradient signal)
+#   - Delta taper (L_suf anneals to 0, pure L_con in phase 4)
+#   - gamma_max=0.35 (moderate, validated stable)
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — no constraints
+use_tanh: false
+use_l2_norm: false
+
+# L_conclusion — 200 tokens, proven regime
+conclusion_n_tokens: 200
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# LOGIT BIAS — proven delivery mechanism
+summary_logit_bias: true
+logit_bias_hidden_dim: 256
+
+# LoRA — adapt attention to handle CCT mask cost
+freeze_base_model: false
+use_lora: true
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.0
+lora_target_modules: ["query_key_value"]
+lora_layers_min: 12
+lora_layers_max: 23
+lora_lr: 2.0e-5
+
+# No other delivery mechanisms
+use_kv_prefix: false
+summary_adapter: false
+summary_attn_bias: false
+summary_conditioning: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 20000
+batch_size: 2
+seq_len: 1024
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 1.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# CURRICULUM — skip phase 1, shorter commitment regime
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.05
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier3-logit-bias-lora-G-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-logit-bias-lora-G"
+results_dir: "./results-tier3-logit-bias-lora-G"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

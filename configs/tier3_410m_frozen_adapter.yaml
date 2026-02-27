@@ -1,0 +1,103 @@
+# Tier 3 Frozen Model + Gated Cross-Attention Adapter — 410M parameters
+# Hardware: 1x RTX 4060 Ti 16GB
+#
+# Key insight from per-step PPL diagnostic:
+#   - CCT training degrades base model weights by +31% (the dominant effect)
+#   - Summaries actively hurt predictions (-0.4 to -1.1 PPL per step)
+#
+# Solution: Freeze base model entirely. Train only:
+#   - Commitment head (produces summaries)
+#   - Summary adapter (gated cross-attention that reads from summary bank)
+#   - Up-project + sufficiency probe
+#
+# Base model quality preserved exactly. Adapter learns to extract from
+# summaries or learns to output zero (gates init near 0). No weight damage.
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 200
+step_boundary_mode: "fixed"
+
+# Sequential training — adapter handles cross-step info
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head
+use_tanh: false
+use_l2_norm: false
+
+# L_conclusion: predict first N tokens from summaries via adapter
+conclusion_n_tokens: 10
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# FROZEN MODEL + ADAPTER
+freeze_base_model: true
+summary_adapter: true
+adapter_d: 64  # bottleneck dimension per layer
+
+# TRAINING
+mode: "finetune"
+total_steps: 20000
+batch_size: 2
+seq_len: 512
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 5.0e-4  # higher LR for adapter-only training (fewer params)
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# CURRICULUM — skip phase 1, ramp faster
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.50
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+  delta_start: 0.1
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier3-frozen-adapter-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-frozen-adapter"
+results_dir: "./results-tier3-frozen-adapter"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

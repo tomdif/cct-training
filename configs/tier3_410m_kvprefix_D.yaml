@@ -1,0 +1,120 @@
+# Tier 3: KV-Cache Prefix Delivery (Config D: strong L_con, tapered L_suf)
+# Hardware: 1x RTX 4060 Ti 16GB
+#
+# Config D: prefix generator + LoRA rank 8 + strong L_con signal.
+# Key changes vs Config C:
+#   - conclusion_n_tokens: 10 → 200 (20x more gradient signal)
+#   - gamma_max: 0.3 → 1.5 (5x stronger L_con weight)
+#   - delta_taper: true (L_suf ramps up in phase 2, anneals to 0 in phase 3)
+# Rationale: L_con's gradient through 24 transformer layers is ~100-1000x
+# weaker than L_suf's direct gradient. Prior runs showed the commitment head
+# converging to hidden-state compression (L_suf) while ignoring the predictive
+# signal (L_con). Tapering L_suf lets the commitment head bootstrap with
+# structured summaries, then switch to "encode what predicts next-step tokens."
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — no constraints
+use_tanh: false
+use_l2_norm: false
+
+# L_conclusion — 200 tokens (20x prior runs), strong weight
+conclusion_n_tokens: 200
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# KV prefix delivery — per-layer MLP generates K/V from summaries
+use_kv_prefix: true
+kv_prefix_hidden: 512
+
+# LoRA for attention adaptation (same as Config C)
+freeze_base_model: false
+use_lora: true
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.0
+lora_target_modules: ["query_key_value"]
+lora_layers_min: 12
+lora_layers_max: 23
+lora_lr: 2.0e-5
+
+# No other delivery mechanisms
+summary_adapter: false
+summary_logit_bias: false
+summary_attn_bias: false
+summary_conditioning: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 20000
+batch_size: 2
+seq_len: 1024
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 1.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# CURRICULUM — skip phase 1, ramp faster
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.50
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 1.5
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier3-kvprefix-D-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-kvprefix-D"
+results_dir: "./results-tier3-kvprefix-D"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

@@ -1,0 +1,123 @@
+# Tier 3: Recurrent Commitment Head + Last-Summary-Only Delivery (Config I)
+# Hardware: 1x RTX 4060 Ti 16GB
+#
+# Run H showed the gate moving to pass-through (0.88 → 0.92) because:
+#   1. Multiplicative gate can only suppress h, never add information
+#   2. Full-bank delivery makes recurrence redundant — logit bias already
+#      sees all prior summaries directly
+#
+# Fix 3: additive fusion + last-summary-only delivery
+#   - Additive: h = h + gate * Linear(prev_summary)
+#     Gate init near 0 (bias=-2.0), grows as model learns to use prev info
+#   - Last-summary-only: logit bias sees ONLY the latest summary
+#     Forces recurrence to carry forward all prior information
+#
+# Risk: at step 10, one 128-dim vector must carry 4000 tokens of info
+# through 10 rounds of lossy compression. Benefit may decrease with
+# distance if information degrades faster than it accumulates.
+#
+# seq_len=4096 gives ~10 steps per sequence (deployment regime).
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — recurrent with additive fusion
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: true
+last_summary_only: true
+
+# L_conclusion — 200 tokens, proven regime
+conclusion_n_tokens: 200
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# FROZEN MODEL + LOGIT BIAS
+freeze_base_model: true
+summary_logit_bias: true
+logit_bias_hidden_dim: 256
+
+# No other delivery mechanisms
+use_kv_prefix: false
+summary_adapter: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 20000
+batch_size: 1
+seq_len: 4096
+gradient_accumulation_steps: 8
+
+optimizer: "adamw"
+learning_rate: 5.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# CURRICULUM — skip phase 1, shorter commitment regime
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.05
+
+# SYNTHETIC DATA — 30% mix of cross-step repetition sequences
+synthetic_data_ratio: 0.3
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier3-recurrent-I-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-recurrent-I"
+results_dir: "./results-tier3-recurrent-I"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

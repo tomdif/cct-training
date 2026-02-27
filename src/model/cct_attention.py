@@ -29,15 +29,16 @@ def assign_tokens_to_steps(
 
     Returns:
         List of length seq_len where element i is the step index for token i.
-        STEP tokens belong to the step they terminate.
+        STEP tokens belong to the step they introduce (the next step), so
+        the next step's tokens can attend to the summary injected there.
     """
     boundary_set = set(boundary_positions)
     step_of = []
     current_step = 0
     for pos in range(seq_len):
-        step_of.append(current_step)
         if pos in boundary_set:
-            current_step += 1
+            current_step += 1  # STEP token belongs to the step it introduces
+        step_of.append(current_step)
     return step_of
 
 
@@ -147,9 +148,9 @@ def build_cct_attention_mask_fast(
         current_step = 0
         ids = []
         for pos in range(seq_len):
-            ids.append(current_step)
             if pos in boundary_set:
-                current_step += 1
+                current_step += 1  # STEP token belongs to the step it introduces
+            ids.append(current_step)
         step_ids = torch.tensor(ids, dtype=torch.long, device=device)
 
     # same_step[i, j] = True iff token i and j are in the same step

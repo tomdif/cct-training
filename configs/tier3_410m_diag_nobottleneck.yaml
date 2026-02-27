@@ -1,0 +1,121 @@
+# DIAGNOSTIC: No-Bottleneck — 410M parameters
+# Purpose: Determine if bottleneck width is the binding constraint
+#
+# Changes from tier3_410m_seq_s200.yaml:
+#   1. d_summary: 128 → 1024 (= d_model, NO compression)
+#   2. d_bottleneck: 256 → 1024 (wide commitment head)
+#   3. decoder_type: "mlp" → "linear" (no MLP decoder, just linear up_project)
+#   4. total_steps: 20000 → 10000 (diagnostic, not full run)
+#
+# If deployment delta drops significantly → bottleneck is the constraint
+# If deployment delta stays ~20% → problem is structural (mask itself)
+
+# ═══════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# ═══════════════════════════════════════
+# CCT ARCHITECTURE
+# ═══════════════════════════════════════
+d_summary: 1024
+d_bottleneck: 1024
+step_length: 200
+step_boundary_mode: "fixed"
+
+# Sequential training mode
+training_mode: "sequential"
+
+# Full detach required for memory-efficient per-step backward
+gradient_isolation: "full_detach"
+
+# Commitment head: no Tanh, no L2 norm
+use_tanh: false
+use_l2_norm: false
+
+# L_conclusion active
+conclusion_n_tokens: 10
+
+# Decoder: linear (no MLP bottleneck)
+decoder_type: "linear"
+
+# ═══════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════
+mode: "finetune"
+total_steps: 10000
+batch_size: 2
+seq_len: 512
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 2.0e-5
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# ═══════════════════════════════════════
+# CURRICULUM
+# ═══════════════════════════════════════
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.50
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+  delta_start: 0.1
+
+# ═══════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# ═══════════════════════════════════════
+# EVALUATION
+# ═══════════════════════════════════════
+eval_interval: 2000
+eval_steps: 100
+
+eval_tasks:
+  - sufficiency_probe
+  - compression_ratio
+  - lm_perplexity
+
+success_criteria:
+  sufficiency_probe_r2: 0.85
+  perplexity_delta_pct: 0.10
+
+# ═══════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════
+wandb_project: "cct-training"
+wandb_name: "tier3-diag-nobottleneck"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-diag-nobottleneck"
+results_dir: "./results-tier3-diag-nobottleneck"
+
+# ═══════════════════════════════════════
+# HARDWARE
+# ═══════════════════════════════════════
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

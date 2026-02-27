@@ -1,0 +1,128 @@
+# Tier 3: Recurrent Commitment Head + Synthetic Data (Config H)
+# Hardware: 1x RTX 4060 Ti 16GB
+#
+# Run F proved logit bias delivers genuine summary benefit (+0.5 PPL),
+# stable across 82 steps at 32K tokens. But the benefit is FLAT — each
+# summary_k = f(hidden_k) is computed independently. Step 9 knows nothing
+# about step 1 because it never saw step 1's summary.
+#
+# This run changes to summary_k = f(hidden_k, summary_{k-1}) via gated
+# fusion in the commitment head. Previous summary modulates the bottleneck
+# activations through a learned gate (initialized near pass-through).
+#
+# Synthetic data (30% mix) injects cross-step token repetitions: a marker
+# span from step K is copied to step K+distance (3-8 steps away). The model
+# must predict the repeated marker — impossible without cross-step memory.
+#
+# Expected: summary benefit grows with step distance (+0.5 at step 1,
+# growing toward +1.0+ at step 10). Flat curve = recurrence not helping.
+#
+# Same frozen base, same logit bias delivery, same training regime as Run F.
+# Only architectural change: recurrent gate in commitment head (+98K params).
+#
+# seq_len=4096 gives ~10 steps per sequence — matches the deployment regime
+# where long-context results were measured. At seq_len=1024 (2.5 steps),
+# there's nothing for recurrence to learn from.
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — no constraints, RECURRENT
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: true
+
+# L_conclusion — 200 tokens, proven regime
+conclusion_n_tokens: 200
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# FROZEN MODEL + LOGIT BIAS
+freeze_base_model: true
+summary_logit_bias: true
+logit_bias_hidden_dim: 256
+
+# No other delivery mechanisms
+use_kv_prefix: false
+summary_adapter: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 20000
+batch_size: 1
+seq_len: 4096
+gradient_accumulation_steps: 8
+
+optimizer: "adamw"
+learning_rate: 5.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# CURRICULUM — skip phase 1, shorter commitment regime
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.05
+
+# SYNTHETIC DATA — 30% mix of cross-step repetition sequences
+synthetic_data_ratio: 0.3
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier3-recurrent-H-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier3-recurrent-H"
+results_dir: "./results-tier3-recurrent-H"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

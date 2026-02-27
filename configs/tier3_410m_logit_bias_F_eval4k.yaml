@@ -1,0 +1,44 @@
+# Eval-only config: Run F checkpoint evaluated at seq_len=4096
+# Same as logit_bias_F but with longer sequences to test summary benefit at distance
+# step_length=400, seq_len=4096 → ~10 steps per sequence (vs ~2.5 at 1024)
+
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+use_tanh: false
+use_l2_norm: false
+conclusion_n_tokens: 200
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+freeze_base_model: true
+summary_logit_bias: true
+logit_bias_hidden_dim: 256
+use_kv_prefix: false
+summary_adapter: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+batch_size: 1
+seq_len: 4096
+
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+results_dir: "./results-tier3-logit-bias-F-4k"

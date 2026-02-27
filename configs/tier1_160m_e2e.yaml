@@ -1,0 +1,126 @@
+# Tier 1 E2E: End-to-End Gradient Experiment — 160M parameters
+# Hardware: 1x RTX 4060 Ti 16GB
+# Goal: Validate whether removing gradient isolation + additive injection
+#        + MLP decoder closes the +78% deployment perplexity gap
+#
+# Key changes from previous runs:
+#   1. Scaled gradient isolation (10% gradient flows through commitment head)
+#   2. Additive injection (summary ADDED to STEP embedding, not replacing it)
+#   3. MLP decoder (128 → 1024 → 768 with GELU)
+#   4. Wider bottleneck: d_summary=128 (was 32)
+#   5. No Tanh, no L2 norm (let gradients flow freely)
+#   6. Smaller model (160M) for fast iteration
+
+# ═══════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════
+base_model: "EleutherAI/pythia-160m-deduped"
+d_model: 768
+n_layers: 12
+n_heads: 12
+vocab_size: 50304
+
+# ═══════════════════════════════════════
+# CCT ARCHITECTURE
+# ═══════════════════════════════════════
+d_summary: 128
+d_bottleneck: 256
+step_length: 50
+step_boundary_mode: "fixed"
+
+summary_injection: "additive"
+
+# Gradient isolation: allow 10% gradient through commitment head
+gradient_isolation: "scaled"
+gradient_scale: 0.1
+
+# Commitment head: no Tanh, no L2 norm
+use_tanh: false
+use_l2_norm: false
+
+# Decoder: MLP instead of linear
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# ═══════════════════════════════════════
+# TRAINING
+# ═══════════════════════════════════════
+mode: "finetune"
+total_steps: 20000
+batch_size: 4
+seq_len: 512
+gradient_accumulation_steps: 2
+
+optimizer: "adamw"
+learning_rate: 3.0e-5
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+
+# ═══════════════════════════════════════
+# CURRICULUM
+# ═══════════════════════════════════════
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.50
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.3
+  delta_max: 0.2
+  delta_start: 0.1
+
+# ═══════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# ═══════════════════════════════════════
+# EVALUATION
+# ═══════════════════════════════════════
+eval_interval: 2000
+eval_steps: 100
+
+eval_tasks:
+  - sufficiency_probe
+  - compression_ratio
+  - lm_perplexity
+
+success_criteria:
+  sufficiency_probe_r2: 0.85
+  perplexity_delta_pct: 0.10
+
+# ═══════════════════════════════════════
+# BASELINE
+# ═══════════════════════════════════════
+train_baseline: true
+baseline_steps: 20000
+
+# ═══════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════
+wandb_project: "cct-training"
+wandb_name: "tier1-e2e-160m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier1-e2e"
+results_dir: "./results-tier1-e2e"
+
+# ═══════════════════════════════════════
+# HARDWARE
+# ═══════════════════════════════════════
+gpu_count: 1
+gpu_type: "RTX-4060Ti-16GB"
+seed: 42
+deterministic: true

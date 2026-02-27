@@ -29,6 +29,12 @@ class CommitmentCurriculum:
         phase2_end: float = 0.50,
         phase3_end: float = 0.80,
         delta_start: float = 0.0,
+        delta_max: float = 0.2,
+        delta_taper: bool = False,
+        gamma_max: float = 0.3,
+        alpha_end: float = 0.5,
+        beta_max: float = 0.5,
+        aux_std_weight: float = 0.0,
         noise_sigma_start: float = 0.0,
         noise_sigma_end: float = 0.0,
     ):
@@ -37,6 +43,12 @@ class CommitmentCurriculum:
         self.p2 = phase2_end
         self.p3 = phase3_end
         self.delta_start = delta_start
+        self.delta_max = delta_max
+        self.delta_taper = delta_taper
+        self.gamma_max = gamma_max
+        self.alpha_end = alpha_end
+        self.beta_max = beta_max
+        self.aux_std_weight = aux_std_weight
         self.noise_sigma_start = noise_sigma_start
         self.noise_sigma_end = noise_sigma_end
 
@@ -65,7 +77,7 @@ class CommitmentCurriculum:
         alpha: standard autoregressive loss weight (decreases)
         beta:  per-step validity loss weight (increases)
         gamma: conclusion-from-premises loss weight (increases)
-        delta: sufficiency loss weight (increases)
+        delta: sufficiency loss weight (increases, optionally tapers to 0)
         """
         progress = current_step / self.total
 
@@ -73,11 +85,36 @@ class CommitmentCurriculum:
         # Ramps from 0 at phase1_end to 1 at phase3_end
         commitment_weight = max(0.0, min(1.0, (progress - self.p1) / (self.p3 - self.p1)))
 
+        # Delta (L_suf) weight with optional tapering
+        if self.delta_taper:
+            # Ramp up during phase 2 (p1 → p2), then taper to 0 during phase 3 (p2 → p3)
+            if progress <= self.p1:
+                delta = self.delta_start
+            elif progress <= self.p2:
+                # Phase 2: ramp from delta_start to delta_max
+                phase2_progress = (progress - self.p1) / (self.p2 - self.p1)
+                delta = self.delta_start + (self.delta_max - self.delta_start) * phase2_progress
+            elif progress <= self.p3:
+                # Phase 3: taper from delta_max to 0
+                phase3_progress = (progress - self.p2) / (self.p3 - self.p2)
+                delta = self.delta_max * (1.0 - phase3_progress)
+            else:
+                # Phase 4: delta = 0
+                delta = 0.0
+        else:
+            delta = self.delta_start + (self.delta_max - self.delta_start) * commitment_weight
+
+        # Base alpha decreases as commitment ramps up
+        alpha = 1.0 - (1.0 - self.alpha_end) * commitment_weight
+        # aux_std_weight: additional L_std boost during phase 3+ to prevent base model drift
+        if self.aux_std_weight > 0 and progress >= self.p2:
+            alpha += self.aux_std_weight
+
         return {
-            "alpha": 1.0 - 0.5 * commitment_weight,  # 1.0 -> 0.5
-            "beta": 0.5 * commitment_weight,  # 0.0 -> 0.5
-            "gamma": 0.3 * commitment_weight,  # 0.0 -> 0.3
-            "delta": self.delta_start + (0.2 - self.delta_start) * commitment_weight,
+            "alpha": alpha,
+            "beta": self.beta_max * commitment_weight,
+            "gamma": self.gamma_max * commitment_weight,
+            "delta": delta,
         }
 
     def get_phase(self, current_step: int) -> int:

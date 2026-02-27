@@ -1,0 +1,134 @@
+# Tier 4: Llama-3.2-1B — Cross-step dependency experiment
+# Hardware: Cloud A100 80GB
+#
+# After 24 configurations on Pythia-410M, every delivery mechanism produces flat
+# ~+0.17 PPL benefit regardless of step distance. Three diagnosed bottlenecks:
+#   1. Representation depth (410M too shallow for complex retention)
+#   2. Data quality (web text lacks real cross-step dependencies)
+#   3. State capacity (128-dim summary too lossy)
+#
+# This config targets all three simultaneously:
+#   - 1B model (2048 hidden dim, 16 layers, 32 heads)
+#   - 70% code + 30% web text (code has real semantic dependencies)
+#   - 256-dim summary state, GRU 256-dim
+#   - 8192 seq_len / 512 step_length = 16 steps per sequence
+#
+# Keep what works: logit bias only, last-summary-only, GRU, multi-hop loss.
+# Success criterion: summary benefit grows with step distance.
+
+# MODEL
+base_model: "unsloth/Llama-3.2-1B"
+d_model: 2048
+n_layers: 16
+n_heads: 32
+vocab_size: 128256
+
+# CCT ARCHITECTURE — larger state for richer model
+d_summary: 256
+d_bottleneck: 512
+step_length: 512
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — GRU recurrent
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: true
+last_summary_only: true
+
+# L_conclusion — 256 tokens (proportional to step_length)
+conclusion_n_tokens: 256
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 2048
+
+# FROZEN MODEL + LOGIT BIAS ONLY
+freeze_base_model: true
+summary_logit_bias: true
+logit_bias_hidden_dim: 512
+
+# No other delivery mechanisms
+summary_adapter: false
+use_kv_prefix: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# MULTI-HOP LOSS
+multi_hop_loss: true
+multi_hop_weight: 0.25
+
+# TRAINING
+mode: "finetune"
+total_steps: 30000
+batch_size: 2
+seq_len: 8192
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 3.0e-4
+weight_decay: 0.01
+warmup_steps: 750
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+attn_implementation: "sdpa"
+
+# CURRICULUM — skip phase 1, shorter commitment regime
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.15
+  phase3_end: 0.35
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.05
+
+# DATA — 70% code + 30% web
+# NOTE: bigcode/starcoderdata is gated — requires HF_TOKEN + terms acceptance
+#   Accept at: https://huggingface.co/datasets/bigcode/starcoderdata
+#   Set: export HF_TOKEN=hf_xxxxx
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+code_dataset: "bigcode/starcoderdata"
+code_data_ratio: 0.7
+code_text_field: "content"
+web_text_field: "text"
+
+# SYNTHETIC DATA — 30% mix with multi-marker cross-step repetitions
+synthetic_data_ratio: 0.3
+multi_marker: true
+
+# VALIDATION / EVAL
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+eval_interval: 3000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier4-llama-1b"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier4-llama-1b"
+results_dir: "./results-tier4-llama-1b"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "A100-80GB"
+seed: 42
+deterministic: true

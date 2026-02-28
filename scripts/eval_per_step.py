@@ -226,6 +226,8 @@ def compute_per_step_sequential(
                             layer.values = layer.values.to(step_embeds.dtype)
                 elif pseudo_decoder is not None and use_summaries and n_prior_steps > 0:
                     # Pseudo-token path: decode each summary into multiple tokens
+                    # Position all pseudo-tokens just before current step to keep
+                    # relative distances small (avoids RoPE extrapolation failure)
                     P = pseudo_decoder.n_pseudo_tokens
                     n_prepend = n_prior_steps * P
                     summary_embeds_list = []
@@ -236,9 +238,9 @@ def compute_per_step_sequential(
                             s = s[:, 0, :]
                         decoded = pseudo_decoder(s).to(step_embeds.dtype)
                         summary_embeds_list.append(decoded)
-                        bp = boundary_positions[s_idx]
-                        for p in range(P):
-                            summary_pos_list.append(bp - P + 1 + p)
+                    # All pseudo-tokens get positions just before step start
+                    for i in range(n_prepend):
+                        summary_pos_list.append(max(0, start - n_prepend + i))
 
                     summary_embeds = torch.cat(summary_embeds_list, dim=1)
                     inputs_embeds = torch.cat([summary_embeds, step_embeds], dim=1)

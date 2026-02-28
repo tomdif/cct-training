@@ -759,6 +759,8 @@ class CCTTrainer:
                         self.summary_conditioner.set_summary(agg)
                 elif self.pseudo_decoder is not None and n_prior_steps > 0:
                     # Pseudo-token path: decode each summary into multiple tokens, prepend
+                    # Position all pseudo-tokens just before current step to keep
+                    # relative distances small (avoids RoPE extrapolation failure)
                     P = self.config.n_pseudo_tokens
                     n_summary_tokens = n_prior_steps * P
                     summary_embeds_list = []
@@ -769,9 +771,9 @@ class CCTTrainer:
                             s = s[:, 0, :]  # (B, d_summary) — use first token
                         decoded = self.pseudo_decoder(s).to(step_embeds.dtype)  # (B, P, D)
                         summary_embeds_list.append(decoded)
-                        bp = boundary_positions[s_idx]
-                        for p in range(P):
-                            summary_pos_list.append(bp - P + 1 + p)
+                    # All pseudo-tokens get positions just before step start
+                    for i in range(n_summary_tokens):
+                        summary_pos_list.append(max(0, start - n_summary_tokens + i))
 
                     summary_embeds = torch.cat(summary_embeds_list, dim=1)
                     inputs_embeds = torch.cat([summary_embeds, step_embeds], dim=1)
@@ -1077,18 +1079,19 @@ class CCTTrainer:
                         con_labels[con_labels == self.step_token_id] = -100
                     elif self.pseudo_decoder is not None:
                         # Pseudo-token path: decode live summaries, prepend + target
+                        # Position pseudo-tokens just before conclusion target
                         P = self.config.n_pseudo_tokens
                         con_summary_embeds_list = []
                         con_summary_pos_list = []
+                        n_con_pseudo = con_step_idx * P
                         for j in range(con_step_idx):
                             s = summaries_live[j]
                             if K > 1:
                                 s = s[:, 0, :]
                             decoded = self.pseudo_decoder(s).to(embed_layer.weight.dtype)
                             con_summary_embeds_list.append(decoded)
-                            bp = boundary_positions[j]
-                            for p in range(P):
-                                con_summary_pos_list.append(bp - P + 1 + p)
+                        for i in range(n_con_pseudo):
+                            con_summary_pos_list.append(max(0, con_start - n_con_pseudo + i))
 
                         con_summary_embeds = torch.cat(con_summary_embeds_list, dim=1)
                         n_sum = con_summary_embeds.size(1)

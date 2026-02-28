@@ -1,0 +1,139 @@
+# Tier 5: Mistral-7B-v0.3 — pseudo-token delivery at 7B scale
+# Hardware: 1x A40/A6000 48GB or A100 80GB (RunPod)
+#
+# Validated on Pythia-410M (Runs M/N):
+#   - Pseudo-token delivery: +0.31 to +1.13 PPL benefit (grows with distance)
+#   - Random ablation: -1.06 to -4.64 (channel is information-bearing)
+#   - Shuffle ablation: ~75% of real (mostly topic, ~25% temporal)
+#
+# This run tests whether the channel scales with model depth.
+# Mistral-7B has 4× the hidden dim and 32 heads (vs Pythia's 16).
+# With 16 pseudo-tokens, every 2 heads share one pseudo-token.
+#
+# Key scaling decisions:
+#   d_summary: 256 (2× Run M — more input dims for 4× larger expansion target)
+#   d_bottleneck: 512 (proportional scaling)
+#   pseudo_decoder_hidden: 1024 (256→1024→16×4096 = ~67M decoder params)
+#   decoder_bottleneck: 4096 (match d_model for sufficiency probe)
+#   Learning rate: 3e-4 (slightly lower — larger decoder needs gentler optimization)
+#
+# Trainable param budget:
+#   Pseudo-token decoder: 256→1024→65536 = ~67.4M
+#   GRU commitment head: GRUCell(256,256) + projections = ~1.1M
+#   Sufficiency probe: 256→4096→4096 = ~17.8M
+#   Up-project: 256→4096 = ~1.0M
+#   Total trainable: ~87M (<1.3% of frozen 7.2B)
+#
+# Memory estimate (bf16):
+#   Model weights: 7.2B × 2B = ~14.4 GB
+#   Activations + grad graph: ~6 GB (sequential steps, ~400 tokens each)
+#   Trainable params + Adam: ~1 GB
+#   Overhead: ~3 GB
+#   Total: ~25 GB → fits comfortably on 48GB GPU
+
+# MODEL
+base_model: "mistralai/Mistral-7B-v0.3"
+d_model: 4096
+n_layers: 32
+n_heads: 32
+vocab_size: 32768
+
+# CCT ARCHITECTURE — scaled for deeper model
+d_summary: 256
+d_bottleneck: 512
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — GRU recurrent (proven retention at 410M)
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: true
+last_summary_only: false   # Full bank: all prior summaries, each decoded
+
+# L_conclusion — 200 tokens
+conclusion_n_tokens: 200
+
+# Decoder: MLP sufficiency probe (scaled to d_model)
+decoder_type: "mlp"
+decoder_bottleneck: 4096
+
+# FROZEN MODEL — pseudo-token delivery only
+freeze_base_model: true
+use_pseudo_tokens: true
+n_pseudo_tokens: 16
+pseudo_decoder_hidden: 1024
+
+# No other delivery mechanisms
+summary_logit_bias: false
+summary_adapter: false
+use_kv_prefix: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# No multi-hop loss
+multi_hop_loss: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 30000
+batch_size: 2
+seq_len: 2048
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 3.0e-4
+weight_decay: 0.01
+warmup_steps: 750
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+attn_implementation: "sdpa"    # Mistral supports SDPA natively
+
+# CURRICULUM
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.0
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 5000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "tier5-mistral-7b-pseudo-tokens"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-tier5-mistral-7b"
+results_dir: "./results-tier5-mistral-7b"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "A40-48GB"
+seed: 42
+deterministic: true

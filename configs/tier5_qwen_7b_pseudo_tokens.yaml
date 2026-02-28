@@ -65,6 +65,11 @@ use_pseudo_tokens: true
 n_pseudo_tokens: 16
 pseudo_decoder_hidden: 1024
 
+# Contrastive summary loss — prevents decoder convergence toward neutrality
+contrastive_summary_loss: true
+contrastive_margin: 0.1
+contrastive_weight: 0.5
+
 # No other delivery mechanisms
 summary_logit_bias: false
 summary_adapter: false

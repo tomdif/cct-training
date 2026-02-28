@@ -202,6 +202,10 @@ def _train_cct(model, tokenizer, step_token_id, config_dict, device, args):
         use_pseudo_tokens=config_dict.get("use_pseudo_tokens", False),
         n_pseudo_tokens=config_dict.get("n_pseudo_tokens", 8),
         pseudo_decoder_hidden=config_dict.get("pseudo_decoder_hidden", 512),
+        # Contrastive summary loss
+        contrastive_summary_loss=config_dict.get("contrastive_summary_loss", False),
+        contrastive_margin=config_dict.get("contrastive_margin", 0.1),
+        contrastive_weight=config_dict.get("contrastive_weight", 0.5),
         # LoRA
         use_lora=config_dict.get("use_lora", False),
         lora_rank=config_dict.get("lora_rank", 16),
@@ -355,6 +359,8 @@ def _train_cct(model, tokenizer, step_token_id, config_dict, device, args):
                 )
                 if 'gate_mean' in loss_dict:
                     log_line += f" gate {loss_dict['gate_mean']:.4f}"
+                if 'contrastive' in loss_dict:
+                    log_line += f" L_ctr {loss_dict['contrastive']:.4f}"
                 if 'hop' in loss_dict:
                     log_line += f" L_hop {loss_dict['hop']:.4f}"
                 if 'adapter_gate_mean' in loss_dict:

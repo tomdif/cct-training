@@ -120,6 +120,11 @@ class TrainConfig:
     n_pseudo_tokens: int = 8      # number of pseudo-tokens per summary
     pseudo_decoder_hidden: int = 512  # hidden dim in decoder MLP
 
+    # Contrastive summary loss — penalizes decoder when summaries don't help
+    contrastive_summary_loss: bool = False
+    contrastive_margin: float = 0.1   # minimum benefit floor (in per-token loss units)
+    contrastive_weight: float = 0.5   # weight relative to other loss terms
+
     # LoRA — lightweight adaptation of base model attention
     use_lora: bool = False
     lora_rank: int = 16
@@ -706,6 +711,8 @@ class CCTTrainer:
         step_hidden_means = []     # probe reconstruction targets
         total_lm_loss = 0.0
         total_lm_tokens = 0
+        total_contrastive = 0.0
+        n_contrastive_steps = 0
 
         # Multi-hop loss: live GRU chain with connected gradient
         live_chain = []            # non-detached GRU summaries for chain gradient
@@ -975,11 +982,47 @@ class CCTTrainer:
                 total_lm_loss += lm_loss.item()
                 total_lm_tokens += n_valid
 
+                # 5.5 Contrastive summary loss: penalize when summaries don't help
+                contrastive_value_step = 0.0
+                contrastive_term = torch.tensor(0.0, device=self.device)
+                if (self.config.contrastive_summary_loss
+                        and self.pseudo_decoder is not None
+                        and n_summary_tokens > 0 and n_valid > 0):
+                    # Reference forward: same step tokens, no pseudo-tokens
+                    with torch.no_grad():
+                        ref_outputs = self.model(
+                            inputs_embeds=step_embeds,
+                            position_ids=step_positions,
+                        )
+                        ref_logits = ref_outputs.logits[:, :-1, :]
+                        ref_labels = step_token_ids[:, 1:].clone()
+                        ref_labels[ref_labels == self.step_token_id] = -100
+                        ref_loss = nn.functional.cross_entropy(
+                            ref_logits.reshape(-1, ref_logits.size(-1)),
+                            ref_labels.reshape(-1),
+                            ignore_index=-100,
+                        )  # per-token mean
+                    # L_with is per-token mean for comparison
+                    l_with = lm_loss / n_valid
+                    # Contrastive: penalize when summaries don't beat no-summaries by margin
+                    contrastive_term = torch.clamp(
+                        l_with - ref_loss.detach() + self.config.contrastive_margin,
+                        min=0.0,
+                    )
+                    contrastive_value_step = contrastive_term.item()
+                    total_contrastive += contrastive_value_step
+                    n_contrastive_steps += 1
+
                 if n_valid > 0:
                     normalized_loss = (
                         weights["alpha"] * lm_loss / n_valid
                         / self.config.gradient_accumulation_steps
                     )
+                    if contrastive_value_step > 0:
+                        normalized_loss = normalized_loss + (
+                            self.config.contrastive_weight * contrastive_term
+                            / self.config.gradient_accumulation_steps
+                        )
                 else:
                     normalized_loss = lm_loss * 0.0
 
@@ -1371,6 +1414,8 @@ class CCTTrainer:
         }
         if hasattr(self.commitment_head, '_last_gate_mean'):
             loss_dict["gate_mean"] = self.commitment_head._last_gate_mean
+        if self.config.contrastive_summary_loss and n_contrastive_steps > 0:
+            loss_dict["contrastive"] = total_contrastive / n_contrastive_steps
         if self.config.multi_hop_loss:
             loss_dict["hop"] = hop_value
         if self.summary_adapter is not None:

@@ -40,7 +40,7 @@ from src.model.summary_conditioner import SummaryConditioner
 from src.model.summary_adapter import SummaryAdapter
 from src.model.summary_logit_bias import SummaryLogitBias
 from src.model.pseudo_token_decoder import PseudoTokenDecoder
-from src.model.model_utils import get_model_layers
+from src.model.model_utils import get_model_layers, detect_lora_target_modules
 from src.training.curriculum import CommitmentCurriculum
 from src.training.loss import compute_cct_loss, SufficiencyProbe
 from src.training.data_pipeline import (
@@ -125,7 +125,7 @@ class TrainConfig:
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.0
-    lora_target_modules: list = field(default_factory=lambda: ["query_key_value"])
+    lora_target_modules: list = field(default_factory=list)  # empty = auto-detect from model
     lora_layers_min: int = 12   # first layer to adapt (0-indexed)
     lora_layers_max: int = 23   # last layer to adapt (inclusive)
     lora_lr: float = 2e-5       # separate LR for LoRA params
@@ -297,11 +297,15 @@ class CCTTrainer:
             layers_to_transform = list(range(
                 config.lora_layers_min, config.lora_layers_max + 1
             ))
+            target_modules = config.lora_target_modules
+            if not target_modules:
+                target_modules = detect_lora_target_modules(model)
+                print(f"  LoRA auto-detected target modules: {target_modules}")
             lora_config = LoraConfig(
                 r=config.lora_rank,
                 lora_alpha=config.lora_alpha,
                 lora_dropout=config.lora_dropout,
-                target_modules=config.lora_target_modules,
+                target_modules=target_modules,
                 layers_to_transform=layers_to_transform,
                 bias="none",
             )

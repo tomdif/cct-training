@@ -536,11 +536,16 @@ def main():
     # Apply LoRA wrapping if checkpoint was trained with LoRA
     if config.get("use_lora", False):
         from peft import LoraConfig, get_peft_model
+        from src.model.model_utils import detect_lora_target_modules
+        target_modules = config.get("lora_target_modules", [])
+        if not target_modules:
+            target_modules = detect_lora_target_modules(cct_model)
+            print(f"  LoRA auto-detected target modules: {target_modules}")
         lora_config = LoraConfig(
             r=config.get("lora_rank", 16),
             lora_alpha=config.get("lora_alpha", 32),
             lora_dropout=0.0,
-            target_modules=config.get("lora_target_modules", ["query_key_value"]),
+            target_modules=target_modules,
             layers_to_transform=list(range(
                 config.get("lora_layers_min", 12),
                 config.get("lora_layers_max", 23) + 1,

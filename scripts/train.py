@@ -207,7 +207,7 @@ def _train_cct(model, tokenizer, step_token_id, config_dict, device, args):
         lora_rank=config_dict.get("lora_rank", 16),
         lora_alpha=config_dict.get("lora_alpha", 32),
         lora_dropout=config_dict.get("lora_dropout", 0.0),
-        lora_target_modules=config_dict.get("lora_target_modules", ["query_key_value"]),
+        lora_target_modules=config_dict.get("lora_target_modules", []),
         lora_layers_min=config_dict.get("lora_layers_min", 12),
         lora_layers_max=config_dict.get("lora_layers_max", 23),
         lora_lr=config_dict.get("lora_lr", 2e-5),

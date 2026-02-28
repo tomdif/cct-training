@@ -87,6 +87,20 @@ class StreamingEvalDataset(torch.utils.data.IterableDataset):
 # KV Cache Utilities
 # ══════════════════════════════════════════════════════════
 
+def _get_kv(cache, layer_idx):
+    """Extract (key, value) from cache at layer_idx, any transformers version."""
+    if hasattr(cache, 'key_cache'):
+        return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
+    # Tuple of (key, value) per layer — legacy or DynamicCache internals
+    try:
+        item = cache[layer_idx]
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            return item[0], item[1]
+    except (TypeError, IndexError):
+        pass
+    raise ValueError(f"Cannot extract KV from {type(cache)}")
+
+
 def extract_step_kv(output_cache, step_token_len, n_layers):
     """Extract KV for only the step's own tokens from model output cache.
 
@@ -98,12 +112,7 @@ def extract_step_kv(output_cache, step_token_len, n_layers):
     """
     step_cache = DynamicCache()
     for layer_idx in range(n_layers):
-        if isinstance(output_cache, DynamicCache):
-            k_full = output_cache.key_cache[layer_idx]
-            v_full = output_cache.value_cache[layer_idx]
-        else:
-            # Legacy tuple format: tuple of (key, value) per layer
-            k_full, v_full = output_cache[layer_idx]
+        k_full, v_full = _get_kv(output_cache, layer_idx)
         # k_full: (B, n_heads, total_len, d_head) — take last step_token_len
         k_step = k_full[:, :, -step_token_len:, :].clone()
         v_step = v_full[:, :, -step_token_len:, :].clone()
@@ -125,11 +134,7 @@ def merge_kv_caches(caches, n_layers):
     for layer_idx in range(n_layers):
         keys, values = [], []
         for cache in caches:
-            if isinstance(cache, DynamicCache):
-                k = cache.key_cache[layer_idx]
-                v = cache.value_cache[layer_idx]
-            else:
-                k, v = cache[layer_idx]
+            k, v = _get_kv(cache, layer_idx)
             keys.append(k)
             values.append(v)
         merged.update(torch.cat(keys, dim=2), torch.cat(values, dim=2), layer_idx)
@@ -141,8 +146,7 @@ def estimate_kv_bank_memory(kv_bank, n_layers):
     total_bytes = 0
     for cache in kv_bank:
         for layer_idx in range(n_layers):
-            k = cache.key_cache[layer_idx]
-            v = cache.value_cache[layer_idx]
+            k, v = _get_kv(cache, layer_idx)
             total_bytes += k.nelement() * k.element_size()
             total_bytes += v.nelement() * v.element_size()
     return total_bytes / (1024 * 1024)

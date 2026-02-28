@@ -1,0 +1,131 @@
+# Run M: Pseudo-token decoder — attention-compatible delivery from compressed summaries
+# Hardware: 1x A100 80GB (RunPod)
+#
+# After 25 configurations, the diagnosed failure mode is consistent:
+#   One vector can't serve all queries simultaneously.
+#   Oracle analysis: even cosine 0.96 summary recovered only 1.1/17.7 PPL gap.
+#   Logit bias: one vocab-sized vector shifts all positions identically.
+#   Adapter/LoRA: model self-adapts around summaries, ignoring them.
+#
+# This run tests the one approach that directly addresses the bottleneck:
+#   Decode the 128-dim summary into 8 pseudo-token embeddings at d_model.
+#   Prepend them so different attention heads can selectively attend to
+#   different pseudo-tokens. Each can specialize: entity, topic, discourse,
+#   syntactic expectations, etc.
+#
+# Key difference from K=4 (Run with n_summary_tokens=4):
+#   K=4 was 4 independent pooling operations from commitment head.
+#   This is a LEARNED EXPANSION: commitment head compresses → 128-dim,
+#   separate decoder reconstructs diverse, attention-compatible representations.
+#   Bottleneck forces prioritization; expansion restores diversity.
+#
+# Compare against Run F's +0.5 flat baseline.
+# If pseudo-token delivery beats +0.5, we've found the channel.
+# If it matches or underperforms, the bottleneck is encoding, not delivery.
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — GRU recurrent (proven retention)
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: true
+last_summary_only: false   # Full bank: all prior summaries, each decoded
+
+# L_conclusion — 200 tokens (matches Run F)
+conclusion_n_tokens: 200
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# FROZEN MODEL — pseudo-token delivery only
+freeze_base_model: true
+use_pseudo_tokens: true
+n_pseudo_tokens: 8
+pseudo_decoder_hidden: 512
+
+# No other delivery mechanisms
+summary_logit_bias: false
+summary_adapter: false
+use_kv_prefix: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# No multi-hop (requires logit bias); L_conclusion drives GRU chain gradient
+multi_hop_loss: false
+
+# TRAINING — match Run F for fair comparison
+mode: "finetune"
+total_steps: 20000
+batch_size: 2
+seq_len: 2048
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 5.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+attn_implementation: "eager"
+
+# CURRICULUM — match Run F
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.0
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "run-M-pseudo-tokens-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-run-M-pseudo-tokens"
+results_dir: "./results-run-M-pseudo-tokens"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "A100-80GB"
+seed: 42
+deterministic: true

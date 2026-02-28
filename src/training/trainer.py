@@ -39,6 +39,7 @@ from src.model.summary_buffer import SummaryBuffer
 from src.model.summary_conditioner import SummaryConditioner
 from src.model.summary_adapter import SummaryAdapter
 from src.model.summary_logit_bias import SummaryLogitBias
+from src.model.pseudo_token_decoder import PseudoTokenDecoder
 from src.model.model_utils import get_model_layers
 from src.training.curriculum import CommitmentCurriculum
 from src.training.loss import compute_cct_loss, SufficiencyProbe
@@ -113,6 +114,11 @@ class TrainConfig:
     # KV-cache prefix delivery — generate per-layer K/V from summaries
     use_kv_prefix: bool = False
     kv_prefix_hidden: int = 512  # hidden dim in prefix generator MLPs
+
+    # Pseudo-token decoder — expand summary into multiple attention-compatible tokens
+    use_pseudo_tokens: bool = False
+    n_pseudo_tokens: int = 8      # number of pseudo-tokens per summary
+    pseudo_decoder_hidden: int = 512  # hidden dim in decoder MLP
 
     # LoRA — lightweight adaptation of base model attention
     use_lora: bool = False
@@ -306,6 +312,19 @@ class CCTTrainer:
             print(f"  LoRA applied: {n_lora:,} trainable / {n_total:,} total "
                   f"(rank={config.lora_rank}, layers {config.lora_layers_min}-{config.lora_layers_max})")
 
+        # Pseudo-token decoder — expand summary into diverse attention tokens
+        self.pseudo_decoder = None
+        if config.use_pseudo_tokens:
+            self.pseudo_decoder = PseudoTokenDecoder(
+                d_summary=config.d_summary,
+                d_model=config.d_model,
+                n_pseudo_tokens=config.n_pseudo_tokens,
+                hidden_dim=config.pseudo_decoder_hidden,
+                device=self.device,
+            )
+            print(f"  Pseudo-token decoder: {self.pseudo_decoder.param_count():,} params "
+                  f"({config.n_pseudo_tokens} tokens)")
+
         # KV-cache prefix generator
         self.prefix_generator = None
         if config.use_kv_prefix:
@@ -337,6 +356,8 @@ class CCTTrainer:
             cct_params.extend(list(self.summary_logit_bias.parameters()))
         if self.prefix_generator is not None:
             cct_params.extend(list(self.prefix_generator.parameters()))
+        if self.pseudo_decoder is not None:
+            cct_params.extend(list(self.pseudo_decoder.parameters()))
         param_groups.append({
             "params": cct_params,
             "lr": config.learning_rate,
@@ -736,6 +757,33 @@ class CCTTrainer:
                         if agg.dim() > 2:  # K > 1: flatten to (B, d_summary)
                             agg = agg.mean(dim=1)
                         self.summary_conditioner.set_summary(agg)
+                elif self.pseudo_decoder is not None and n_prior_steps > 0:
+                    # Pseudo-token path: decode each summary into multiple tokens, prepend
+                    P = self.config.n_pseudo_tokens
+                    n_summary_tokens = n_prior_steps * P
+                    summary_embeds_list = []
+                    summary_pos_list = []
+                    for s_idx in range(n_prior_steps):
+                        s = committed_summaries[s_idx]
+                        if K > 1:
+                            s = s[:, 0, :]  # (B, d_summary) — use first token
+                        decoded = self.pseudo_decoder(s).to(step_embeds.dtype)  # (B, P, D)
+                        summary_embeds_list.append(decoded)
+                        bp = boundary_positions[s_idx]
+                        for p in range(P):
+                            summary_pos_list.append(bp - P + 1 + p)
+
+                    summary_embeds = torch.cat(summary_embeds_list, dim=1)
+                    inputs_embeds = torch.cat([summary_embeds, step_embeds], dim=1)
+                    summary_positions = torch.tensor(
+                        summary_pos_list, dtype=torch.long, device=self.device
+                    ).unsqueeze(0).expand(batch_size, -1)
+                    position_ids = torch.cat([summary_positions, step_positions], dim=1)
+                elif self.pseudo_decoder is not None:
+                    # First step, no summaries yet
+                    n_summary_tokens = 0
+                    inputs_embeds = step_embeds
+                    position_ids = step_positions
                 elif self.summary_logit_bias is not None:
                     # Logit bias path: no prepended tokens, bias applied post-forward
                     n_summary_tokens = 0
@@ -1027,6 +1075,44 @@ class CCTTrainer:
                         con_logits = con_outputs.logits[:, :-1, :]
                         con_labels = con_target_ids[:, 1:].clone()
                         con_labels[con_labels == self.step_token_id] = -100
+                    elif self.pseudo_decoder is not None:
+                        # Pseudo-token path: decode live summaries, prepend + target
+                        P = self.config.n_pseudo_tokens
+                        con_summary_embeds_list = []
+                        con_summary_pos_list = []
+                        for j in range(con_step_idx):
+                            s = summaries_live[j]
+                            if K > 1:
+                                s = s[:, 0, :]
+                            decoded = self.pseudo_decoder(s).to(embed_layer.weight.dtype)
+                            con_summary_embeds_list.append(decoded)
+                            bp = boundary_positions[j]
+                            for p in range(P):
+                                con_summary_pos_list.append(bp - P + 1 + p)
+
+                        con_summary_embeds = torch.cat(con_summary_embeds_list, dim=1)
+                        n_sum = con_summary_embeds.size(1)
+
+                        con_target_ids = input_ids[:, con_start:con_start + n_target]
+                        con_target_embeds = embed_layer(con_target_ids)
+                        con_target_positions = torch.arange(
+                            con_start, con_start + n_target, device=self.device
+                        ).unsqueeze(0).expand(batch_size, -1)
+
+                        con_embeds = torch.cat([con_summary_embeds, con_target_embeds], dim=1)
+                        con_summary_pos = torch.tensor(
+                            con_summary_pos_list, dtype=torch.long, device=self.device
+                        ).unsqueeze(0).expand(batch_size, -1)
+                        con_positions = torch.cat([con_summary_pos, con_target_positions], dim=1)
+
+                        con_outputs = self.model(
+                            inputs_embeds=con_embeds,
+                            position_ids=con_positions,
+                        )
+
+                        con_logits = con_outputs.logits[:, n_sum - 1 : n_sum + n_target - 1, :]
+                        con_labels = con_target_ids.clone()
+                        con_labels[con_labels == self.step_token_id] = -100
                     elif self.summary_logit_bias is not None:
                         # Logit bias path: forward only target tokens, bias applied below
                         con_target_ids = input_ids[:, con_start:con_start + n_target]
@@ -1253,6 +1339,8 @@ class CCTTrainer:
                 all_params.extend(list(self.summary_adapter.parameters()))
             if self.summary_logit_bias is not None:
                 all_params.extend(list(self.summary_logit_bias.parameters()))
+            if self.pseudo_decoder is not None:
+                all_params.extend(list(self.pseudo_decoder.parameters()))
             nn.utils.clip_grad_norm_(all_params, self.config.max_grad_norm)
             self.optimizer.step()
             self.scheduler.step()
@@ -1301,6 +1389,7 @@ class CCTTrainer:
                 "summary_adapter_state_dict": self.summary_adapter.state_dict() if self.summary_adapter is not None else None,
                 "summary_logit_bias_state_dict": self.summary_logit_bias.state_dict() if self.summary_logit_bias is not None else None,
                 "prefix_generator_state_dict": self.prefix_generator.state_dict() if self.prefix_generator is not None else None,
+                "pseudo_decoder_state_dict": self.pseudo_decoder.state_dict() if self.pseudo_decoder is not None else None,
             },
             path,
         )
@@ -1325,3 +1414,5 @@ class CCTTrainer:
             self.summary_logit_bias.load_state_dict(ckpt["summary_logit_bias_state_dict"])
         if "prefix_generator_state_dict" in ckpt and ckpt["prefix_generator_state_dict"] is not None and self.prefix_generator is not None:
             self.prefix_generator.load_state_dict(ckpt["prefix_generator_state_dict"])
+        if "pseudo_decoder_state_dict" in ckpt and ckpt["pseudo_decoder_state_dict"] is not None and self.pseudo_decoder is not None:
+            self.pseudo_decoder.load_state_dict(ckpt["pseudo_decoder_state_dict"])

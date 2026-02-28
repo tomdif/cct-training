@@ -44,6 +44,7 @@ from src.model.commitment_head import CommitmentHead
 from src.model.summary_buffer import SummaryBuffer
 from src.model.summary_adapter import SummaryAdapter
 from src.model.summary_logit_bias import SummaryLogitBias
+from src.model.pseudo_token_decoder import PseudoTokenDecoder
 
 
 class StreamingEvalDataset(torch.utils.data.IterableDataset):
@@ -144,6 +145,7 @@ def compute_per_step_sequential(
     summary_adapter=None,
     summary_logit_bias=None,
     prefix_generator=None,
+    pseudo_decoder=None,
     config=None,
 ):
     """Sequential eval with per-step PPL breakdown.
@@ -222,6 +224,21 @@ def compute_per_step_sequential(
                         for layer in step_past_kv.layers:
                             layer.keys = layer.keys.to(step_embeds.dtype)
                             layer.values = layer.values.to(step_embeds.dtype)
+                elif pseudo_decoder is not None and use_summaries and n_prior_steps > 0:
+                    # Pseudo-token path: decode each summary into multiple tokens
+                    P = pseudo_decoder.n_pseudo_tokens
+                    n_prepend = n_prior_steps * P
+                    summary_embeds_list = []
+                    summary_pos_list = []
+                    for s_idx in range(n_prior_steps):
+                        s = committed_summaries[s_idx]
+                        if K > 1:
+                            s = s[:, 0, :]
+                        decoded = pseudo_decoder(s).to(step_embeds.dtype)
+                        summary_embeds_list.append(decoded)
+                        bp = boundary_positions[s_idx]
+                        for p in range(P):
+                            summary_pos_list.append(bp - P + 1 + p)
                 elif use_summaries and n_prior_steps > 0:
                     # Attention path: prepend summary tokens
                     n_prepend = n_prior_steps * K
@@ -427,6 +444,7 @@ def main():
             attn_implementation="eager",
             torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         ).to(device)
+        baseline_model.resize_token_embeddings(len(tokenizer))
 
         eval_dataset_a = StreamingEvalDataset(
             dataset_name=config.get("validation_dataset", config["dataset"]),
@@ -542,6 +560,21 @@ def main():
         summary_logit_bias.load_state_dict(ckpt["summary_logit_bias_state_dict"])
         print(f"  Loaded summary logit bias: {summary_logit_bias.param_count():,} params")
 
+    # Load pseudo-token decoder if present
+    pseudo_decoder = None
+    if ckpt.get("pseudo_decoder_state_dict") is not None:
+        pseudo_decoder = PseudoTokenDecoder(
+            d_summary=config["d_summary"],
+            d_model=config["d_model"],
+            n_pseudo_tokens=config.get("n_pseudo_tokens", 8),
+            hidden_dim=config.get("pseudo_decoder_hidden", 512),
+            device=device,
+        )
+        pseudo_decoder.load_state_dict(ckpt["pseudo_decoder_state_dict"])
+        pseudo_decoder.eval()
+        print(f"  Loaded pseudo-token decoder: {pseudo_decoder.param_count():,} params "
+              f"({config.get('n_pseudo_tokens', 8)} tokens)")
+
     # Load prefix generator if present
     prefix_generator = None
     if ckpt.get("prefix_generator_state_dict") is not None:
@@ -579,6 +612,7 @@ def main():
         summary_adapter=summary_adapter,
         summary_logit_bias=summary_logit_bias,
         prefix_generator=prefix_generator,
+        pseudo_decoder=pseudo_decoder,
         config=config,
     )
     total_ws = sum(ws_loss.values()) / sum(ws_tok.values())
@@ -609,6 +643,7 @@ def main():
         summary_adapter=summary_adapter,
         summary_logit_bias=summary_logit_bias,
         prefix_generator=prefix_generator,
+        pseudo_decoder=pseudo_decoder,
         config=config,
     )
     total_ns = sum(ns_loss.values()) / sum(ns_tok.values())

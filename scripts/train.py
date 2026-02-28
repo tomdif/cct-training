@@ -198,6 +198,10 @@ def _train_cct(model, tokenizer, step_token_id, config_dict, device, args):
         # KV-cache prefix delivery
         use_kv_prefix=config_dict.get("use_kv_prefix", False),
         kv_prefix_hidden=config_dict.get("kv_prefix_hidden", 512),
+        # Pseudo-token decoder
+        use_pseudo_tokens=config_dict.get("use_pseudo_tokens", False),
+        n_pseudo_tokens=config_dict.get("n_pseudo_tokens", 8),
+        pseudo_decoder_hidden=config_dict.get("pseudo_decoder_hidden", 512),
         # LoRA
         use_lora=config_dict.get("use_lora", False),
         lora_rank=config_dict.get("lora_rank", 16),

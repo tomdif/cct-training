@@ -99,7 +99,8 @@ def extract_step_kv(output_cache, step_token_len, n_layers):
     step_cache = DynamicCache()
     for layer_idx in range(n_layers):
         if isinstance(output_cache, DynamicCache):
-            k_full, v_full = output_cache[layer_idx]
+            k_full = output_cache.key_cache[layer_idx]
+            v_full = output_cache.value_cache[layer_idx]
         else:
             # Legacy tuple format: tuple of (key, value) per layer
             k_full, v_full = output_cache[layer_idx]
@@ -125,7 +126,8 @@ def merge_kv_caches(caches, n_layers):
         keys, values = [], []
         for cache in caches:
             if isinstance(cache, DynamicCache):
-                k, v = cache[layer_idx]
+                k = cache.key_cache[layer_idx]
+                v = cache.value_cache[layer_idx]
             else:
                 k, v = cache[layer_idx]
             keys.append(k)
@@ -139,7 +141,8 @@ def estimate_kv_bank_memory(kv_bank, n_layers):
     total_bytes = 0
     for cache in kv_bank:
         for layer_idx in range(n_layers):
-            k, v = cache[layer_idx]
+            k = cache.key_cache[layer_idx]
+            v = cache.value_cache[layer_idx]
             total_bytes += k.nelement() * k.element_size()
             total_bytes += v.nelement() * v.element_size()
     return total_bytes / (1024 * 1024)

@@ -114,6 +114,15 @@ def _cache_to_tuples(cache, n_layers):
     )
 
 
+def _tuples_to_cache(kv_tuples):
+    """Convert list/tuple of (key, value) back to DynamicCache for model input."""
+    from transformers.cache_utils import DynamicCache
+    cache = DynamicCache()
+    for layer_idx, (k, v) in enumerate(kv_tuples):
+        cache.update(k, v, layer_idx)
+    return cache
+
+
 def extract_step_kv(output_cache, step_token_len, n_layers):
     """Extract KV for only the step's own tokens from model output cache.
 
@@ -312,11 +321,15 @@ def compute_retrieval_condition(
                         retrieved_kv = merge_kv_caches(selected_caches, n_layers)
 
                 # ---- Forward pass ----
+                past_kv_arg = (
+                    _tuples_to_cache(retrieved_kv)
+                    if retrieved_kv is not None else None
+                )
                 outputs = model(
                     inputs_embeds=inputs_embeds,
                     position_ids=position_ids,
                     output_hidden_states=True,
-                    past_key_values=retrieved_kv,
+                    past_key_values=past_kv_arg,
                     use_cache=True,
                 )
 

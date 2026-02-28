@@ -47,6 +47,9 @@ from src.training.data_pipeline import (
     get_step_boundary_positions,
     get_step_ranges,
 )
+from src.model.kv_cache_utils import (
+    _tuples_to_cache, extract_step_kv, merge_kv_caches,
+)
 
 
 @dataclass
@@ -124,6 +127,11 @@ class TrainConfig:
     contrastive_summary_loss: bool = False
     contrastive_margin: float = 0.1   # minimum benefit floor (in per-token loss units)
     contrastive_weight: float = 0.5   # weight relative to other loss terms
+
+    # KV retrieval during training — retrieve past steps' KV caches
+    use_kv_retrieval: bool = False
+    retrieval_k: int = 2              # number of past step KV caches to retrieve
+    max_kv_bank_size: int = 8         # max stored KV caches (evicts oldest)
 
     # LoRA — lightweight adaptation of base model attention
     use_lora: bool = False
@@ -714,6 +722,10 @@ class CCTTrainer:
         total_contrastive = 0.0
         n_contrastive_steps = 0
 
+        # KV retrieval bank (training-time retrieval)
+        kv_bank = []               # stored KV caches from past steps
+        bank_summaries = []        # summaries aligned with kv_bank entries
+
         # Multi-hop loss: live GRU chain with connected gradient
         live_chain = []            # non-detached GRU summaries for chain gradient
         step_base_logits_list = [] # pre-bias logits per step (detached) for L_hop
@@ -847,6 +859,14 @@ class CCTTrainer:
                     inputs_embeds = step_embeds
                     position_ids = step_positions
 
+                # 2.5. KV retrieval: prepend retrieved past-step KV caches
+                if self.config.use_kv_retrieval and len(kv_bank) > 0:
+                    n_layers = self.model.config.num_hidden_layers
+                    ret_start = max(0, len(kv_bank) - self.config.retrieval_k)
+                    selected = kv_bank[ret_start:]
+                    merged = merge_kv_caches(list(selected), n_layers)
+                    step_past_kv = _tuples_to_cache(merged)
+
                 # 3. Forward pass
                 attn_mask = None
                 if self.summary_attn_bias_param is not None and not use_conditioning:
@@ -861,12 +881,27 @@ class CCTTrainer:
                     attention_mask=attn_mask,
                     output_hidden_states=True,
                     past_key_values=step_past_kv,
+                    use_cache=self.config.use_kv_retrieval,
                 )
                 self._summary_n_tokens = 0
                 if use_conditioning:
                     self.summary_conditioner.clear()
                 if use_adapter:
                     self.summary_adapter.clear()
+
+                # 3.3 Extract and store step KV for retrieval bank
+                if (self.config.use_kv_retrieval and not is_last_step
+                        and outputs.past_key_values is not None):
+                    with torch.no_grad():
+                        n_layers = self.model.config.num_hidden_layers
+                        step_kv = extract_step_kv(
+                            outputs.past_key_values, step_len, n_layers
+                        )
+                        kv_bank.append(step_kv)
+                        while len(kv_bank) > self.config.max_kv_bank_size:
+                            kv_bank.pop(0)
+                            if bank_summaries:
+                                bank_summaries.pop(0)
 
                 # 3.5 Apply logit bias from summary bank
                 _step_bias = None  # saved for multi-hop pre-bias reconstruction
@@ -926,6 +961,8 @@ class CCTTrainer:
                         scale=self.config.gradient_scale,
                     )
                     committed_summaries.append(summary_detached)
+                    if self.config.use_kv_retrieval:
+                        bank_summaries.append(summary_detached)
 
                     # Build live GRU chain for multi-hop loss (non-detached)
                     if self.config.multi_hop_loss and self.config.recurrent_commitment:

@@ -206,6 +206,10 @@ def _train_cct(model, tokenizer, step_token_id, config_dict, device, args):
         contrastive_summary_loss=config_dict.get("contrastive_summary_loss", False),
         contrastive_margin=config_dict.get("contrastive_margin", 0.1),
         contrastive_weight=config_dict.get("contrastive_weight", 0.5),
+        # KV retrieval during training
+        use_kv_retrieval=config_dict.get("use_kv_retrieval", False),
+        retrieval_k=config_dict.get("retrieval_k", 2),
+        max_kv_bank_size=config_dict.get("max_kv_bank_size", 8),
         # LoRA
         use_lora=config_dict.get("use_lora", False),
         lora_rank=config_dict.get("lora_rank", 16),

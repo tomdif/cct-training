@@ -1,0 +1,136 @@
+# Run P: Retrieval-in-the-loop training — pseudo-tokens + KV retrieval
+# Hardware: 1x A100 80GB (RunPod)
+#
+# Run O showed hybrid CCT (pseudo-tokens + retrieved KV) achieves 21.78 PPL
+# at 8K, but a plain 800-token sliding window gets 21.93 — only +0.14 gap.
+# The retrieval was never trained; the model hasn't learned to partition
+# information between pseudo-tokens and retrieved KV.
+#
+# Training with retrieval in the loop will let components specialize:
+#   - Pseudo-tokens: beyond-window aggregate context
+#   - Commitment head: retrieval-useful similarity scores
+#   - GRU: complementary accumulation
+#
+# Everything else matches Run O exactly for fair comparison.
+# Checkpoint every 2K for convergence curve.
+#
+# Memory: per-step KV ~150 MB, bank of 8 ~1.2 GB. Fits on A100 80GB.
+# FLOPs: ~2x per step (800 extra tokens in attention), but no backward
+# through base model (KV is detached).
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — GRU recurrent (proven retention)
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: true
+last_summary_only: false   # Full bank: all prior summaries, each decoded
+
+# L_conclusion — 200 tokens (matches Run O)
+conclusion_n_tokens: 200
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# FROZEN MODEL — pseudo-token delivery only
+freeze_base_model: true
+use_pseudo_tokens: true
+n_pseudo_tokens: 16
+pseudo_decoder_hidden: 768
+
+# CONTRASTIVE SUMMARY LOSS (matches Run O)
+contrastive_summary_loss: true
+contrastive_margin: 0.1
+contrastive_weight: 0.5
+
+# KV RETRIEVAL DURING TRAINING — the variable under test
+use_kv_retrieval: true
+retrieval_k: 2
+max_kv_bank_size: 8
+
+# No other delivery mechanisms
+summary_logit_bias: false
+summary_adapter: false
+use_kv_prefix: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# No multi-hop
+multi_hop_loss: false
+
+# TRAINING — 15K steps, checkpoint every 2K for convergence curve
+mode: "finetune"
+total_steps: 15000
+batch_size: 2
+seq_len: 2048
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 5.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+attn_implementation: "eager"
+
+# CURRICULUM — match Run O
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.0
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 2000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "run-P-retrieval-training-410m"
+log_interval: 50
+save_interval: 2000
+save_dir: "./checkpoints-run-P-retrieval"
+results_dir: "./results-run-P-retrieval"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "A100-80GB"
+seed: 42
+deterministic: true

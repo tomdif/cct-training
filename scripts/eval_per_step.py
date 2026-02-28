@@ -239,6 +239,13 @@ def compute_per_step_sequential(
                         bp = boundary_positions[s_idx]
                         for p in range(P):
                             summary_pos_list.append(bp - P + 1 + p)
+
+                    summary_embeds = torch.cat(summary_embeds_list, dim=1)
+                    inputs_embeds = torch.cat([summary_embeds, step_embeds], dim=1)
+                    summary_positions = torch.tensor(
+                        summary_pos_list, dtype=torch.long, device=device
+                    ).unsqueeze(0).expand(batch_size, -1)
+                    position_ids = torch.cat([summary_positions, step_positions], dim=1)
                 elif use_summaries and n_prior_steps > 0:
                     # Attention path: prepend summary tokens
                     n_prepend = n_prior_steps * K

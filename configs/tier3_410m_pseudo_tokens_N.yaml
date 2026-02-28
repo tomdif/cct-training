@@ -1,0 +1,130 @@
+# Run N: 16 pseudo-tokens — scaling the verified delivery channel
+# Hardware: 1x A100 80GB (RunPod)
+#
+# Run M proved pseudo-token delivery works:
+#   - Real summaries: +0.31 to +1.13 PPL benefit (grows with distance)
+#   - Random ablation: -1.06 to -4.64 (actively harmful — channel is information-bearing)
+#   - Shuffle ablation: ~75% of real benefit (mostly topic, ~25% temporal)
+#
+# The ~1.0 PPL ceiling at 8 pseudo-tokens may be capacity-limited.
+# Each summary is decoded into 8 × 1024-dim tokens — 16 attention heads
+# share 8 key-value pairs. Doubling to 16 gives each head a dedicated
+# pseudo-token, potentially allowing finer-grained specialization.
+#
+# Changes from Run M:
+#   - n_pseudo_tokens: 8 → 16  (2× attention targets per summary)
+#   - pseudo_decoder_hidden: 512 → 768  (decoder needs more capacity for 16× expansion)
+#   - total_steps: 20000 → 30000  (longer training for joint compression+expansion learning)
+#   - save_interval: 5000 → 5000  (checkpoint every 5K for benefit-vs-training-step plot)
+#
+# Trainable param budget:
+#   Decoder: 128→768→16×1024 = ~16.9M (was ~4.3M)
+#   GRU + up-project + probe: ~2.5M (unchanged)
+#   Total: ~19.4M (still <5% of frozen 410M)
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — GRU recurrent (proven retention)
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: true
+last_summary_only: false   # Full bank: all prior summaries, each decoded
+
+# L_conclusion — 200 tokens (matches Run M)
+conclusion_n_tokens: 200
+
+# Decoder: MLP (for sufficiency probe)
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# FROZEN MODEL — pseudo-token delivery only
+freeze_base_model: true
+use_pseudo_tokens: true
+n_pseudo_tokens: 16
+pseudo_decoder_hidden: 768
+
+# No other delivery mechanisms
+summary_logit_bias: false
+summary_adapter: false
+use_kv_prefix: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# No multi-hop (requires logit bias); L_conclusion drives GRU chain gradient
+multi_hop_loss: false
+
+# TRAINING — longer than Run M for convergence
+mode: "finetune"
+total_steps: 30000
+batch_size: 2
+seq_len: 2048
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 5.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+attn_implementation: "eager"
+
+# CURRICULUM — match Run M
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.0
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 5000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "run-N-pseudo-16tok-410m"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-run-N-pseudo-16tok"
+results_dir: "./results-run-N-pseudo-16tok"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "A100-80GB"
+seed: 42
+deterministic: true

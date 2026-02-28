@@ -2,11 +2,12 @@
 Retrieval CCT eval: tests whether retrieving past steps' real KV caches
 improves PPL over pseudo-tokens alone.
 
-Runs FOUR conditions with per-step PPL breakdown:
+Runs FIVE conditions with per-step PPL breakdown:
   1. Pseudo-only     — existing pseudo-token delivery (reference)
   2. Retrieval-only  — past KV from K most recent steps, no pseudo-tokens
   3. Hybrid          — pseudo-tokens + retrieved KV caches
   4. Isolated        — each step in isolation (reference)
+  5. Sliding window  — plain 800-token prior context, no CCT (prior art baseline)
 
 The key insight: summaries carry ~75% topic signal but miss specific facts.
 Retrieved KV caches provide full-fidelity past context. The hybrid combines
@@ -207,6 +208,90 @@ def select_retrieval_indices(strategy, kv_bank_size, retrieval_k,
 
     else:
         raise ValueError(f"Unknown retrieval strategy: {strategy}")
+
+
+# ══════════════════════════════════════════════════════════
+# Sliding window baseline (no CCT, pure prior art)
+# ══════════════════════════════════════════════════════════
+
+def compute_sliding_window(model, dataloader, step_token_id, device,
+                           max_batches, window_tokens=800):
+    """Sliding window baseline: each step sees window_tokens of raw prior context.
+
+    No commitment head, no pseudo-tokens, no GRU — just the frozen model
+    with a limited context window. This is the prior-art comparison.
+    """
+    model.eval()
+    step_loss = defaultdict(float)
+    step_tokens_dict = defaultdict(int)
+    n_batches = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if n_batches >= max_batches:
+                break
+            input_ids = batch.to(device)
+            batch_size = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+
+            boundary_positions = get_step_boundary_positions(
+                input_ids[0].tolist(), step_token_id
+            )
+            step_ranges = get_step_ranges(seq_len, boundary_positions)
+
+            for step_idx, (start, end) in enumerate(step_ranges):
+                step_len = end - start
+                if step_len <= 0:
+                    continue
+
+                # Window: up to window_tokens before current step + current step
+                win_start = max(0, start - window_tokens)
+                win_ids = input_ids[:, win_start:end]
+
+                # Absolute position IDs
+                win_positions = torch.arange(
+                    win_start, end, device=device
+                ).unsqueeze(0).expand(batch_size, -1)
+
+                # Full attention within window (no CCT, no past_key_values)
+                outputs = model(
+                    input_ids=win_ids,
+                    position_ids=win_positions,
+                )
+
+                # Loss on current step tokens only
+                offset = start - win_start
+                step_logits = outputs.logits[:, offset:offset + step_len - 1, :]
+                step_labels = input_ids[:, start + 1:end].clone()
+                step_labels[step_labels == step_token_id] = -100
+
+                # Cross-boundary: logit at offset-1 predicts first step token
+                if offset > 0:
+                    cross_logit = outputs.logits[:, offset - 1:offset, :]
+                    first_label = input_ids[:, start:start + 1].clone()
+                    first_label[first_label == step_token_id] = -100
+                    step_logits = torch.cat([cross_logit, step_logits], dim=1)
+                    step_labels = torch.cat([first_label, step_labels], dim=1)
+
+                loss = F.cross_entropy(
+                    step_logits.reshape(-1, step_logits.size(-1)),
+                    step_labels.reshape(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                n_valid = (step_labels.reshape(-1) != -100).sum().item()
+                step_loss[step_idx] += loss.item()
+                step_tokens_dict[step_idx] += n_valid
+
+            n_batches += 1
+            if n_batches % 50 == 0:
+                total_l = sum(step_loss.values())
+                total_t = sum(step_tokens_dict.values())
+                avg = total_l / total_t if total_t > 0 else 0
+                print(f"  batch {n_batches}/{max_batches} | "
+                      f"avg loss {avg:.4f} | ppl {math.exp(avg):.2f}")
+
+    return step_loss, step_tokens_dict, n_batches
 
 
 # ══════════════════════════════════════════════════════════
@@ -412,22 +497,50 @@ def compute_retrieval_condition(
 
 def format_retrieval_table(results_dict, max_step):
     """Format per-step PPL comparison across all conditions."""
+    has_sw = "sliding_window" in results_dict
+    w = 130 if has_sw else 110
     lines = []
     lines.append("")
-    lines.append("=" * 110)
+    lines.append("=" * w)
     lines.append("RETRIEVAL CCT: PER-STEP PERPLEXITY COMPARISON")
-    lines.append("=" * 110)
-    lines.append(
+    lines.append("=" * w)
+
+    hdr1 = (
         f"  {'Step':>4}  {'Pseudo':>10}  {'Retrieval':>10}  "
-        f"{'Hybrid':>10}  {'Isolated':>10}  "
-        f"{'Ret-Iso':>10}  {'Hyb-Psd':>10}  {'Hyb-Iso':>10}"
+        f"{'Hybrid':>10}  {'Isolated':>10}"
     )
-    lines.append(
+    hdr2 = (
         f"  {'':>4}  {'Only':>10}  {'Only':>10}  "
-        f"{'P+R':>10}  {'(no ctx)':>10}  "
-        f"{'benefit':>10}  {'benefit':>10}  {'benefit':>10}"
+        f"{'P+R':>10}  {'(no ctx)':>10}"
     )
-    lines.append("-" * 110)
+    if has_sw:
+        hdr1 += f"  {'SlidWin':>10}"
+        hdr2 += f"  {'(prior)':>10}"
+    hdr1 += f"  {'Hyb-Iso':>10}  {'Hyb-Psd':>10}  {'Hyb-SW':>10}"
+    hdr2 += f"  {'benefit':>10}  {'benefit':>10}  {'vs prior':>10}"
+    lines.append(hdr1)
+    lines.append(hdr2)
+    lines.append("-" * w)
+
+    def _row(label, ppls):
+        p = ppls.get("pseudo_only", float('nan'))
+        r = ppls.get("retrieval_only", float('nan'))
+        h = ppls.get("hybrid", float('nan'))
+        iso = ppls.get("isolated", float('nan'))
+        sw = ppls.get("sliding_window", float('nan'))
+
+        hyb_iso = iso - h if not (math.isnan(iso) or math.isnan(h)) else float('nan')
+        hyb_psd = p - h if not (math.isnan(p) or math.isnan(h)) else float('nan')
+        hyb_sw = sw - h if not (math.isnan(sw) or math.isnan(h)) else float('nan')
+
+        row = (
+            f"  {label:>4}  {p:>10.2f}  {r:>10.2f}  "
+            f"{h:>10.2f}  {iso:>10.2f}"
+        )
+        if has_sw:
+            row += f"  {sw:>10.2f}"
+        row += f"  {hyb_iso:>+10.2f}  {hyb_psd:>+10.2f}  {hyb_sw:>+10.2f}"
+        return row
 
     for step_idx in range(max_step + 1):
         ppls = {}
@@ -435,52 +548,26 @@ def format_retrieval_table(results_dict, max_step):
             l = s_loss.get(step_idx, 0)
             t = s_tok.get(step_idx, 0)
             ppls[cond_name] = math.exp(l / t) if t > 0 else float('nan')
-
-        p = ppls.get("pseudo_only", float('nan'))
-        r = ppls.get("retrieval_only", float('nan'))
-        h = ppls.get("hybrid", float('nan'))
-        iso = ppls.get("isolated", float('nan'))
-
-        ret_iso = iso - r if not (math.isnan(iso) or math.isnan(r)) else float('nan')
-        hyb_psd = p - h if not (math.isnan(p) or math.isnan(h)) else float('nan')
-        hyb_iso = iso - h if not (math.isnan(iso) or math.isnan(h)) else float('nan')
-
-        lines.append(
-            f"  {step_idx:>4}  {p:>10.2f}  {r:>10.2f}  "
-            f"{h:>10.2f}  {iso:>10.2f}  "
-            f"{ret_iso:>+10.2f}  {hyb_psd:>+10.2f}  {hyb_iso:>+10.2f}"
-        )
+        lines.append(_row(str(step_idx), ppls))
 
     # Totals
-    lines.append("-" * 110)
+    lines.append("-" * w)
     totals = {}
     for cond_name, (s_loss, s_tok) in results_dict.items():
         tl = sum(s_loss.values())
         tt = sum(s_tok.values())
         totals[cond_name] = math.exp(tl / tt) if tt > 0 else float('nan')
-
-    p = totals.get("pseudo_only", float('nan'))
-    r = totals.get("retrieval_only", float('nan'))
-    h = totals.get("hybrid", float('nan'))
-    iso = totals.get("isolated", float('nan'))
-
-    ret_iso = iso - r if not (math.isnan(iso) or math.isnan(r)) else float('nan')
-    hyb_psd = p - h if not (math.isnan(p) or math.isnan(h)) else float('nan')
-    hyb_iso = iso - h if not (math.isnan(iso) or math.isnan(h)) else float('nan')
-
-    lines.append(
-        f"  {'ALL':>4}  {p:>10.2f}  {r:>10.2f}  "
-        f"{h:>10.2f}  {iso:>10.2f}  "
-        f"{ret_iso:>+10.2f}  {hyb_psd:>+10.2f}  {hyb_iso:>+10.2f}"
-    )
+    lines.append(_row("ALL", totals))
 
     lines.append("")
     lines.append("INTERPRETATION:")
-    lines.append("  Ret-Iso: positive = KV retrieval helps over isolation")
-    lines.append("  Hyb-Psd: positive = adding retrieval to pseudo-tokens helps")
-    lines.append("  Hyb-Iso: positive = hybrid helps over isolation (total benefit)")
-    lines.append("  If Hyb-Psd >> 0: retrieval carries info pseudo-tokens miss")
-    lines.append("  If Ret-Iso ~ Pseudo benefit: retrieval and pseudo overlap")
+    lines.append("  Hyb-Iso:  positive = hybrid CCT helps over isolation (total benefit)")
+    lines.append("  Hyb-Psd:  positive = adding KV retrieval to pseudo-tokens helps")
+    lines.append("  Hyb-SW:   positive = hybrid CCT beats plain sliding window (CRITICAL)")
+    lines.append("")
+    lines.append("  If Hyb-SW > 0: CCT adds genuine value over prior-art sliding window")
+    lines.append("  If Hyb-SW ~ 0: retrieved KV = sliding window, pseudo-tokens add nothing")
+    lines.append("  If Hyb-SW < 0: plain sliding window beats CCT (bad)")
 
     return "\n".join(lines)
 
@@ -503,8 +590,11 @@ def main():
                         help="How to select which past steps to retrieve")
     parser.add_argument("--max-bank-size", type=int, default=8,
                         help="Max KV caches stored (evicts oldest)")
+    parser.add_argument("--window-tokens", type=int, default=800,
+                        help="Sliding window size in tokens (prior art baseline)")
     parser.add_argument("--skip-pseudo-only", action="store_true")
     parser.add_argument("--skip-isolated", action="store_true")
+    parser.add_argument("--skip-sliding-window", action="store_true")
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
@@ -519,6 +609,7 @@ def main():
     print(f"Expected steps per sequence: ~{seq_len // (step_length + 1)}")
     print(f"Retrieval: strategy={args.retrieval_strategy}, "
           f"k={args.retrieval_k}, max_bank={args.max_bank_size}")
+    print(f"Sliding window: {args.window_tokens} tokens (prior art baseline)")
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -723,6 +814,23 @@ def main():
                       f"({iso_tok[si]} tokens)")
         results_dict["isolated"] = (iso_loss, iso_tok)
 
+    # ── Condition 5: Sliding window (prior art baseline) ──
+    if not args.skip_sliding_window:
+        print("\n" + "=" * 60)
+        print(f"CONDITION 5: SLIDING WINDOW ({args.window_tokens} tokens, no CCT)")
+        print("=" * 60)
+        sw_loss, sw_tok, sw_n = compute_sliding_window(
+            model, make_loader(), step_token_id, device,
+            args.eval_batches, window_tokens=args.window_tokens,
+        )
+        total = sum(sw_loss.values()) / max(sum(sw_tok.values()), 1)
+        print(f"\n  Sliding window total: loss={total:.4f} ppl={math.exp(total):.2f}")
+        for si in sorted(sw_loss.keys()):
+            if sw_tok[si] > 0:
+                print(f"    step {si}: ppl={math.exp(sw_loss[si] / sw_tok[si]):.2f} "
+                      f"({sw_tok[si]} tokens)")
+        results_dict["sliding_window"] = (sw_loss, sw_tok)
+
     # ── Comparison table ──
     max_step = max(
         max(s_loss.keys()) for s_loss, _ in results_dict.values() if s_loss
@@ -741,6 +849,7 @@ def main():
             "retrieval_k": args.retrieval_k,
             "retrieval_strategy": args.retrieval_strategy,
             "max_bank_size": args.max_bank_size,
+            "window_tokens": args.window_tokens,
         },
         "memory": memory_stats,
         "per_step": {},

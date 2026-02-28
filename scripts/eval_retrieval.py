@@ -90,18 +90,17 @@ class StreamingEvalDataset(torch.utils.data.IterableDataset):
 def _cache_to_tuples(cache, n_layers):
     """Convert any cache format to list of (key, value) tuples."""
     result = []
-    # Try DynamicCache attributes
+    # Newer transformers: .layers list with .keys/.values per layer
+    if hasattr(cache, 'layers') and isinstance(cache.layers, list):
+        for layer in cache.layers:
+            result.append((layer.keys, layer.values))
+        return result
+    # Mid-version: .key_cache/.value_cache lists
     if hasattr(cache, 'key_cache'):
         for i in range(n_layers):
             result.append((cache.key_cache[i], cache.value_cache[i]))
         return result
-    # Try to_legacy_cache()
-    if hasattr(cache, 'to_legacy_cache'):
-        legacy = cache.to_legacy_cache()
-        for i in range(n_layers):
-            result.append((legacy[i][0], legacy[i][1]))
-        return result
-    # Try direct tuple indexing
+    # Legacy: tuple of (key, value) per layer
     try:
         for i in range(n_layers):
             item = cache[i]
@@ -109,17 +108,6 @@ def _cache_to_tuples(cache, n_layers):
         return result
     except (TypeError, IndexError, KeyError):
         pass
-    # Last resort: inspect internal dict for tensor lists
-    for attr_name in dir(cache):
-        if 'key' in attr_name and not attr_name.startswith('__'):
-            key_attr = getattr(cache, attr_name)
-            if isinstance(key_attr, list) and len(key_attr) == n_layers:
-                val_name = attr_name.replace('key', 'value')
-                val_attr = getattr(cache, val_name, None)
-                if val_attr is not None:
-                    for i in range(n_layers):
-                        result.append((key_attr[i], val_attr[i]))
-                    return result
     raise ValueError(
         f"Cannot extract KV from {type(cache)}. "
         f"Attrs: {[a for a in dir(cache) if not a.startswith('__')]}"

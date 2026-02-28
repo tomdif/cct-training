@@ -147,11 +147,13 @@ def compute_per_step_sequential(
     prefix_generator=None,
     pseudo_decoder=None,
     config=None,
+    ablation="none",
 ):
     """Sequential eval with per-step PPL breakdown.
 
     use_summaries=True: normal sequential with summary injection
     use_summaries=False: each step in isolation (no prior context)
+    ablation: "none"=normal, "random"=random summary vectors, "shuffle"=permute step order
     """
     model.eval()
     commitment_head.eval()
@@ -232,8 +234,26 @@ def compute_per_step_sequential(
                     n_prepend = n_prior_steps * P
                     summary_embeds_list = []
                     summary_pos_list = []
+
+                    # Apply ablation to summaries used for delivery
+                    # (GRU recurrence uses real summaries — ablation only affects delivery)
+                    if ablation == "random":
+                        delivery_summaries = []
+                        for s_idx in range(n_prior_steps):
+                            s = committed_summaries[s_idx]
+                            rand_s = torch.randn_like(s)
+                            # Match L2 norm of the real summary
+                            real_norm = s.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                            rand_s = rand_s / rand_s.norm(dim=-1, keepdim=True).clamp(min=1e-8) * real_norm
+                            delivery_summaries.append(rand_s)
+                    elif ablation == "shuffle":
+                        perm = torch.randperm(n_prior_steps)
+                        delivery_summaries = [committed_summaries[p.item()] for p in perm]
+                    else:
+                        delivery_summaries = committed_summaries[:n_prior_steps]
+
                     for s_idx in range(n_prior_steps):
-                        s = committed_summaries[s_idx]
+                        s = delivery_summaries[s_idx]
                         if K > 1:
                             s = s[:, 0, :]
                         decoded = pseudo_decoder(s).to(step_embeds.dtype)
@@ -411,6 +431,11 @@ def main():
     parser.add_argument("--eval-batches", type=int, default=200)
     parser.add_argument("--seq-len", type=int, default=None,
                         help="Override seq_len (default: from config)")
+    parser.add_argument("--ablation", type=str, default="none",
+                        choices=["none", "random", "shuffle"],
+                        help="Ablation mode: random=random summaries, shuffle=permute order")
+    parser.add_argument("--skip-baseline", action="store_true",
+                        help="Skip Condition A (baseline) — useful for ablation runs")
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
@@ -423,6 +448,10 @@ def main():
     print(f"Config: seq_len={seq_len}, step_length={step_length}, "
           f"n_summary_tokens={n_summary_tokens}")
     print(f"Expected steps per sequence: ~{seq_len // (step_length + 1)}")
+    if args.ablation != "none":
+        print(f"ABLATION MODE: {args.ablation}")
+        print(f"  random  = replace summaries with norm-matched random vectors")
+        print(f"  shuffle = permute temporal order of summary bank")
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -443,49 +472,55 @@ def main():
     # ══════════════════════════════════════════════════════════
     # CONDITION A: BASELINE (full attention, per-step breakdown)
     # ══════════════════════════════════════════════════════════
-    print("\n" + "=" * 60)
-    print("CONDITION A: BASELINE (full attention)")
-    print("=" * 60)
     baseline_oom = False
-    try:
-        baseline_model = AutoModelForCausalLM.from_pretrained(
-            args.baseline_dir,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        ).to(device)
-        baseline_model.resize_token_embeddings(len(tokenizer))
-
-        eval_dataset_a = StreamingEvalDataset(
-            dataset_name=config.get("validation_dataset", config["dataset"]),
-            split=config.get("validation_split", "train"),
-            tokenizer=tokenizer, seq_len=seq_len,
-            step_token_id=step_token_id, step_length=step_length,
-            skip_examples=50000,
-        )
-        loader_a = DataLoader(eval_dataset_a, batch_size=batch_size)
-        bl_loss, bl_tok, bl_n = compute_per_step_baseline(
-            baseline_model, loader_a, step_token_id, device, args.eval_batches
-        )
-        total_bl = sum(bl_loss.values()) / sum(bl_tok.values())
-        print(f"\n  Baseline total: loss={total_bl:.4f} ppl={math.exp(total_bl):.2f}")
-        for si in sorted(bl_loss.keys()):
-            if bl_tok[si] > 0:
-                ppl = math.exp(bl_loss[si] / bl_tok[si])
-                print(f"    step {si}: ppl={ppl:.2f} ({bl_tok[si]} tokens)")
-
-        del baseline_model
-    except torch.cuda.OutOfMemoryError:
-        print(f"\n  *** BASELINE OOM: Cannot process seq_len={seq_len} with full attention ***")
-        print(f"  *** Attention matrix alone requires ~{seq_len**2 * 16 * 2 / 1e9:.1f} GB per layer ***")
-        baseline_oom = True
-        bl_loss, bl_tok = {}, {}
-        # Try to clean up partial allocation
+    bl_loss, bl_tok = {}, {}
+    if args.skip_baseline:
+        print("\n" + "=" * 60)
+        print("CONDITION A: BASELINE — SKIPPED (--skip-baseline)")
+        print("=" * 60)
+    else:
+        print("\n" + "=" * 60)
+        print("CONDITION A: BASELINE (full attention)")
+        print("=" * 60)
         try:
+            baseline_model = AutoModelForCausalLM.from_pretrained(
+                args.baseline_dir,
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+            ).to(device)
+            baseline_model.resize_token_embeddings(len(tokenizer))
+
+            eval_dataset_a = StreamingEvalDataset(
+                dataset_name=config.get("validation_dataset", config["dataset"]),
+                split=config.get("validation_split", "train"),
+                tokenizer=tokenizer, seq_len=seq_len,
+                step_token_id=step_token_id, step_length=step_length,
+                skip_examples=50000,
+            )
+            loader_a = DataLoader(eval_dataset_a, batch_size=batch_size)
+            bl_loss, bl_tok, bl_n = compute_per_step_baseline(
+                baseline_model, loader_a, step_token_id, device, args.eval_batches
+            )
+            total_bl = sum(bl_loss.values()) / sum(bl_tok.values())
+            print(f"\n  Baseline total: loss={total_bl:.4f} ppl={math.exp(total_bl):.2f}")
+            for si in sorted(bl_loss.keys()):
+                if bl_tok[si] > 0:
+                    ppl = math.exp(bl_loss[si] / bl_tok[si])
+                    print(f"    step {si}: ppl={ppl:.2f} ({bl_tok[si]} tokens)")
+
             del baseline_model
-        except NameError:
-            pass
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            print(f"\n  *** BASELINE OOM: Cannot process seq_len={seq_len} with full attention ***")
+            print(f"  *** Attention matrix alone requires ~{seq_len**2 * 16 * 2 / 1e9:.1f} GB per layer ***")
+            baseline_oom = True
+            bl_loss, bl_tok = {}, {}
+            # Try to clean up partial allocation
+            try:
+                del baseline_model
+            except NameError:
+                pass
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # Load CCT model + components
     print("\nLoading CCT model...")
@@ -603,8 +638,11 @@ def main():
     # ══════════════════════════════════════════════════════════
     # CONDITION B: SEQUENTIAL WITH SUMMARIES
     # ══════════════════════════════════════════════════════════
+    ablation_label = ""
+    if args.ablation != "none":
+        ablation_label = f" [ABLATION: {args.ablation}]"
     print("\n" + "=" * 60)
-    print("CONDITION B: SEQUENTIAL WITH SUMMARIES")
+    print(f"CONDITION B: SEQUENTIAL WITH SUMMARIES{ablation_label}")
     print("=" * 60)
     eval_dataset_b = StreamingEvalDataset(
         dataset_name=config.get("validation_dataset", config["dataset"]),
@@ -623,6 +661,7 @@ def main():
         prefix_generator=prefix_generator,
         pseudo_decoder=pseudo_decoder,
         config=config,
+        ablation=args.ablation,
     )
     total_ws = sum(ws_loss.values()) / sum(ws_tok.values())
     print(f"\n  Sequential (w/ summaries) total: loss={total_ws:.4f} ppl={math.exp(total_ws):.2f}")
@@ -688,6 +727,7 @@ def main():
             "step_length": step_length,
             "n_summary_tokens": n_summary_tokens,
             "eval_batches": args.eval_batches,
+            "ablation": args.ablation,
         },
         "per_step": {},
     }
@@ -703,7 +743,8 @@ def main():
 
     results_dir = Path(config.get("results_dir", "./results-per-step"))
     results_dir.mkdir(parents=True, exist_ok=True)
-    out_path = results_dir / f"per_step_ppl_seqlen{seq_len}.json"
+    ablation_suffix = f"_ablation_{args.ablation}" if args.ablation != "none" else ""
+    out_path = results_dir / f"per_step_ppl_seqlen{seq_len}{ablation_suffix}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved to {out_path}")

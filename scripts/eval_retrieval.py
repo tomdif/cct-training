@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -87,58 +87,76 @@ class StreamingEvalDataset(torch.utils.data.IterableDataset):
 # KV Cache Utilities
 # ══════════════════════════════════════════════════════════
 
-def _get_kv(cache, layer_idx):
-    """Extract (key, value) from cache at layer_idx, any transformers version."""
+def _cache_to_tuples(cache, n_layers):
+    """Convert any cache format to list of (key, value) tuples."""
+    result = []
+    # Try DynamicCache attributes
     if hasattr(cache, 'key_cache'):
-        return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
-    # Tuple of (key, value) per layer — legacy or DynamicCache internals
+        for i in range(n_layers):
+            result.append((cache.key_cache[i], cache.value_cache[i]))
+        return result
+    # Try to_legacy_cache()
+    if hasattr(cache, 'to_legacy_cache'):
+        legacy = cache.to_legacy_cache()
+        for i in range(n_layers):
+            result.append((legacy[i][0], legacy[i][1]))
+        return result
+    # Try direct tuple indexing
     try:
-        item = cache[layer_idx]
-        if isinstance(item, (tuple, list)) and len(item) == 2:
-            return item[0], item[1]
-    except (TypeError, IndexError):
+        for i in range(n_layers):
+            item = cache[i]
+            result.append((item[0], item[1]))
+        return result
+    except (TypeError, IndexError, KeyError):
         pass
-    raise ValueError(f"Cannot extract KV from {type(cache)}")
+    # Last resort: inspect internal dict for tensor lists
+    for attr_name in dir(cache):
+        if 'key' in attr_name and not attr_name.startswith('__'):
+            key_attr = getattr(cache, attr_name)
+            if isinstance(key_attr, list) and len(key_attr) == n_layers:
+                val_name = attr_name.replace('key', 'value')
+                val_attr = getattr(cache, val_name, None)
+                if val_attr is not None:
+                    for i in range(n_layers):
+                        result.append((key_attr[i], val_attr[i]))
+                    return result
+    raise ValueError(
+        f"Cannot extract KV from {type(cache)}. "
+        f"Attrs: {[a for a in dir(cache) if not a.startswith('__')]}"
+    )
 
 
 def extract_step_kv(output_cache, step_token_len, n_layers):
     """Extract KV for only the step's own tokens from model output cache.
 
-    After model(..., use_cache=True), the output cache contains
-    [past_kv_len + current_input_len] total entries. The step's real
-    tokens are always the LAST step_token_len entries.
-
-    Returns a DynamicCache with only this step's KV.
+    Returns a tuple of (key, value) per layer (plain tensors, no DynamicCache).
     """
-    step_cache = DynamicCache()
-    for layer_idx in range(n_layers):
-        k_full, v_full = _get_kv(output_cache, layer_idx)
-        # k_full: (B, n_heads, total_len, d_head) — take last step_token_len
+    raw = _cache_to_tuples(output_cache, n_layers)
+    result = []
+    for k_full, v_full in raw:
         k_step = k_full[:, :, -step_token_len:, :].clone()
         v_step = v_full[:, :, -step_token_len:, :].clone()
-        step_cache.update(k_step, v_step, layer_idx)
-    return step_cache
+        result.append((k_step, v_step))
+    return tuple(result)
 
 
 def merge_kv_caches(caches, n_layers):
     """Concatenate multiple step KV caches along the sequence dimension.
 
-    Returns a single DynamicCache with all steps' KV merged.
+    Input: list of tuple-of-(key,value) caches.
+    Returns: tuple of (key, value) per layer.
     """
     if not caches:
         return None
     if len(caches) == 1:
         return caches[0]
 
-    merged = DynamicCache()
+    result = []
     for layer_idx in range(n_layers):
-        keys, values = [], []
-        for cache in caches:
-            k, v = _get_kv(cache, layer_idx)
-            keys.append(k)
-            values.append(v)
-        merged.update(torch.cat(keys, dim=2), torch.cat(values, dim=2), layer_idx)
-    return merged
+        keys = [c[layer_idx][0] for c in caches]
+        values = [c[layer_idx][1] for c in caches]
+        result.append((torch.cat(keys, dim=2), torch.cat(values, dim=2)))
+    return tuple(result)
 
 
 def estimate_kv_bank_memory(kv_bank, n_layers):
@@ -146,7 +164,7 @@ def estimate_kv_bank_memory(kv_bank, n_layers):
     total_bytes = 0
     for cache in kv_bank:
         for layer_idx in range(n_layers):
-            k, v = _get_kv(cache, layer_idx)
+            k, v = cache[layer_idx]
             total_bytes += k.nelement() * k.element_size()
             total_bytes += v.nelement() * v.element_size()
     return total_bytes / (1024 * 1024)

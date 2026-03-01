@@ -1,0 +1,146 @@
+# Run R: Qwen2.5-7B — Hierarchical summary tree + KV retrieval
+# Hardware: 1x A100 80GB (RunPod)
+#
+# Run Q used flat GRU chain for summary accumulation. Eval showed:
+#   - 16K: GRU +1.13, Tree +1.22 vs sliding window
+#   - 32K: GRU +0.07 (dead), Tree +0.98
+#   - 64K: GRU -3.88 (harmful), Tree +0.44
+#
+# The flat GRU collapses at O(N) sequential updates. The hierarchical
+# tree maintains O(log N) depth and stable benefit at all lengths.
+#
+# Architecture:
+#   Level 0: per-step raw summaries (no GRU recurrence)
+#   Level 1: mean-pool groups of 8 level-0 summaries
+#   Level 2+: mean-pool groups of 8 level-(N-1) summaries
+#   Pseudo-tokens decoded from multi-level selection (~6 summaries)
+#   Retrieved KV from 2 most recent steps (unchanged from Run Q)
+#
+# Trainable param budget (smaller than Run Q — no GRU):
+#   Pseudo-token decoder: 256→1024→16×3584 = ~59.4M
+#   Commitment head (no GRU): 3584→512→256 = ~2.0M
+#   Sufficiency probe: 256→3584→3584 = ~13.8M
+#   Up-project: 256→3584 = ~0.9M
+#   Total trainable: ~76M (~1% of frozen 7.6B)
+
+# MODEL
+base_model: "Qwen/Qwen2.5-7B"
+d_model: 3584
+n_layers: 28
+n_heads: 28
+vocab_size: 152064
+
+# CCT ARCHITECTURE — scaled for deeper model
+d_summary: 256
+d_bottleneck: 512
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — NO GRU, raw per-step summaries for tree
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: false    # KEY CHANGE: no GRU
+last_summary_only: false
+
+# HIERARCHICAL SUMMARY TREE — O(log N) depth replaces O(N) GRU chain
+hierarchical_tree: true
+branching_factor: 8
+n_recent_l0: 3
+
+# L_conclusion — 200 tokens
+conclusion_n_tokens: 200
+
+# Decoder: MLP sufficiency probe (scaled to d_model)
+decoder_type: "mlp"
+decoder_bottleneck: 3584
+
+# FROZEN MODEL — pseudo-token delivery only
+freeze_base_model: true
+use_pseudo_tokens: true
+n_pseudo_tokens: 16
+pseudo_decoder_hidden: 1024
+
+# KV RETRIEVAL DURING TRAINING — validated at 410M in Run P
+use_kv_retrieval: true
+retrieval_k: 2
+max_kv_bank_size: 8
+
+# Contrastive summary loss — prevents decoder convergence toward neutrality
+contrastive_summary_loss: true
+contrastive_margin: 0.1
+contrastive_weight: 0.5
+
+# No other delivery mechanisms
+summary_logit_bias: false
+summary_adapter: false
+use_kv_prefix: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# No multi-hop loss (requires GRU)
+multi_hop_loss: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 30000
+batch_size: 2
+seq_len: 2048
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 3.0e-4
+weight_decay: 0.01
+warmup_steps: 750
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+attn_implementation: "sdpa"    # Qwen supports SDPA natively
+
+# CURRICULUM
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.0
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 5000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "run-R-qwen-7b-hierarchical"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-run-R-qwen-7b"
+results_dir: "./results-run-R-qwen-7b"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "A100-80GB"
+seed: 42
+deterministic: true

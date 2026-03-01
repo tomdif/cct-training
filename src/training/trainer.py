@@ -52,6 +52,76 @@ from src.model.kv_cache_utils import (
 )
 
 
+# ══════════════════════════════════════════════════════════
+# Hierarchical summary tree
+# ══════════════════════════════════════════════════════════
+
+def build_summary_tree(summaries, branching_factor=8):
+    """Build hierarchical tree from flat list of level-0 summaries.
+
+    Level 0: raw per-step summaries
+    Level 1: mean-pool groups of B level-0
+    Level 2: mean-pool groups of B level-1
+    ...
+
+    Returns dict mapping level -> list of summary tensors.
+    """
+    import torch.nn.functional as F
+    tree = {0: summaries}
+    current = summaries
+    level = 0
+
+    while len(current) > 1:
+        level += 1
+        parents = []
+        for i in range(0, len(current), branching_factor):
+            group = current[i:i + branching_factor]
+            if not group:
+                continue
+            stacked = torch.stack(group, dim=0)  # (group_size, B, d_summary)
+            parent = stacked.mean(dim=0)          # (B, d_summary)
+            parent = F.normalize(parent, dim=-1)
+            parents.append(parent)
+        tree[level] = parents
+        current = parents
+
+    return tree
+
+
+def select_from_tree(tree, current_step, n_recent=3, branching_factor=8):
+    """Select summaries from tree for pseudo-token decoding.
+
+    Returns recent level-0 summaries + covering higher-level summaries.
+    Total selection is O(log N) instead of O(N).
+    """
+    selected = []
+    max_level = max(tree.keys())
+
+    # Level 0: n_recent most recent summaries before current step
+    level0 = tree[0]
+    available = level0[:current_step]
+    recent = available[-n_recent:] if len(available) >= n_recent else available
+    selected.extend(recent)
+    recent_indices = set(range(max(0, current_step - n_recent), current_step))
+
+    # Higher levels: include summaries covering steps not already in recent
+    for level in range(1, max_level + 1):
+        level_summaries = tree[level]
+        group_size = branching_factor ** level
+
+        for idx, summary in enumerate(level_summaries):
+            cover_start = idx * group_size
+            cover_end = min((idx + 1) * group_size, current_step)
+            if cover_end <= 0 or cover_start >= current_step:
+                continue
+            covered = set(range(cover_start, cover_end))
+            if covered.issubset(recent_indices):
+                continue
+            selected.append(summary)
+
+    return selected
+
+
 @dataclass
 class TrainConfig:
     """Training configuration."""
@@ -156,6 +226,11 @@ class TrainConfig:
     # Recurrent commitment head
     recurrent_commitment: bool = False
     last_summary_only: bool = False  # Only pass latest summary to logit bias
+
+    # Hierarchical summary tree — replaces flat GRU chain with O(log N) depth tree
+    hierarchical_tree: bool = False
+    branching_factor: int = 8       # children per parent node
+    n_recent_l0: int = 3            # recent level-0 summaries in pseudo-token selection
 
     # Multi-hop loss: gradient flows through full GRU chain
     multi_hop_loss: bool = False
@@ -781,15 +856,28 @@ class CCTTrainer:
                             agg = agg.mean(dim=1)
                         self.summary_conditioner.set_summary(agg)
                 elif self.pseudo_decoder is not None and n_prior_steps > 0:
-                    # Pseudo-token path: decode each summary into multiple tokens, prepend
-                    # Position all pseudo-tokens just before current step to keep
-                    # relative distances small (avoids RoPE extrapolation failure)
+                    # Pseudo-token path: decode summaries into multiple tokens, prepend
                     P = self.config.n_pseudo_tokens
-                    n_summary_tokens = n_prior_steps * P
+
+                    if self.config.hierarchical_tree:
+                        # Hierarchical tree: select O(log N) summaries from multi-level tree
+                        summary_tree = build_summary_tree(
+                            committed_summaries, self.config.branching_factor
+                        )
+                        tree_selected = select_from_tree(
+                            summary_tree, step_idx,
+                            n_recent=self.config.n_recent_l0,
+                            branching_factor=self.config.branching_factor,
+                        )
+                        summaries_to_decode = tree_selected
+                    else:
+                        # Flat: decode ALL prior summaries
+                        summaries_to_decode = committed_summaries
+
+                    n_summary_tokens = len(summaries_to_decode) * P
                     summary_embeds_list = []
                     summary_pos_list = []
-                    for s_idx in range(n_prior_steps):
-                        s = committed_summaries[s_idx]
+                    for s in summaries_to_decode:
                         if K > 1:
                             s = s[:, 0, :]  # (B, d_summary) — use first token
                         decoded = self.pseudo_decoder(s).to(step_embeds.dtype)  # (B, P, D)
@@ -928,8 +1016,11 @@ class CCTTrainer:
 
                     # For recurrent mode: pass previous summary (detached to prevent
                     # gradient flowing through the entire chain of steps)
+                    # Hierarchical tree mode: NO recurrence — raw per-step summaries
                     prev_sum = None
-                    if self.config.recurrent_commitment and committed_summaries:
+                    if (self.config.recurrent_commitment
+                            and not self.config.hierarchical_tree
+                            and committed_summaries):
                         ps = committed_summaries[-1]  # already detached
                         # If multi-token, use first token's summary for recurrence
                         if K > 1:
@@ -1162,14 +1253,27 @@ class CCTTrainer:
                         con_labels = con_target_ids[:, 1:].clone()
                         con_labels[con_labels == self.step_token_id] = -100
                     elif self.pseudo_decoder is not None:
-                        # Pseudo-token path: decode live summaries, prepend + target
-                        # Position pseudo-tokens just before conclusion target
+                        # Pseudo-token path: decode summaries, prepend + target
                         P = self.config.n_pseudo_tokens
+
+                        if self.config.hierarchical_tree:
+                            # Tree selection for conclusion loss
+                            con_tree = build_summary_tree(
+                                summaries_live[:con_step_idx],
+                                self.config.branching_factor,
+                            )
+                            con_selected = select_from_tree(
+                                con_tree, con_step_idx,
+                                n_recent=self.config.n_recent_l0,
+                                branching_factor=self.config.branching_factor,
+                            )
+                        else:
+                            con_selected = summaries_live[:con_step_idx]
+
                         con_summary_embeds_list = []
                         con_summary_pos_list = []
-                        n_con_pseudo = con_step_idx * P
-                        for j in range(con_step_idx):
-                            s = summaries_live[j]
+                        n_con_pseudo = len(con_selected) * P
+                        for s in con_selected:
                             if K > 1:
                                 s = s[:, 0, :]
                             decoded = self.pseudo_decoder(s).to(embed_layer.weight.dtype)

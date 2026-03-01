@@ -99,10 +99,17 @@ def estimate_kv_bank_memory(kv_bank, n_layers):
 
 
 def select_retrieval_indices(strategy, kv_bank_size, retrieval_k,
-                             bank_summaries=None, current_summary=None):
+                             bank_summaries=None, current_summary=None,
+                             bank_embeddings=None, current_embedding=None):
     """Select which past step KV caches to retrieve.
 
     Returns list of bank indices in chronological order.
+
+    Strategies:
+      recent:         K most recent steps
+      all:            all stored steps
+      similarity:     cosine sim between GRU summaries (degenerates to recent)
+      step_embedding: cosine sim between mean-pooled step hidden states (pre-GRU)
     """
     if kv_bank_size == 0:
         return []
@@ -132,6 +139,26 @@ def select_retrieval_indices(strategy, kv_bank_size, retrieval_k,
             sims.append((i, cos_sim))
 
         # Top-K by similarity, returned in chronological order
+        sims.sort(key=lambda x: x[1], reverse=True)
+        selected = sorted([idx for idx, _ in sims[:retrieval_k]])
+        return selected
+
+    elif strategy == "step_embedding":
+        if bank_embeddings is None or current_embedding is None or len(bank_embeddings) == 0:
+            start = max(0, kv_bank_size - retrieval_k)
+            return list(range(start, kv_bank_size))
+
+        # Cosine similarity: current step's mean-pooled hidden vs each stored
+        # These are pre-GRU, so they encode per-step content, not accumulated state
+        curr = current_embedding[0]  # (d_model,)
+        sims = []
+        for i in range(min(kv_bank_size, len(bank_embeddings))):
+            e = bank_embeddings[i][0]  # (d_model,)
+            cos_sim = F.cosine_similarity(
+                curr.unsqueeze(0), e.unsqueeze(0)
+            ).item()
+            sims.append((i, cos_sim))
+
         sims.sort(key=lambda x: x[1], reverse=True)
         selected = sorted([idx for idx, _ in sims[:retrieval_k]])
         return selected
@@ -275,6 +302,8 @@ def compute_retrieval_condition(
             committed_summaries = []  # Full list (for GRU recurrence)
             kv_bank = []              # Stored KV caches (max_bank_size)
             bank_summaries = []       # Summaries aligned with kv_bank
+            bank_embeddings = []      # Mean-pooled step hidden states (pre-GRU)
+            current_embedding = None  # Current step's mean-pooled hidden
 
             for step_idx, (start, end) in enumerate(step_ranges):
                 step_len = end - start
@@ -330,6 +359,8 @@ def compute_retrieval_condition(
                         current_summary=(
                             committed_summaries[-1] if committed_summaries else None
                         ),
+                        bank_embeddings=bank_embeddings,
+                        current_embedding=current_embedding,
                     )
                     if indices:
                         selected_caches = [kv_bank[i] for i in indices]
@@ -362,6 +393,8 @@ def compute_retrieval_condition(
                         del evicted
                         if bank_summaries:
                             bank_summaries.pop(0)
+                        if bank_embeddings:
+                            bank_embeddings.pop(0)
 
                     # Track peak memory
                     bank_mb = estimate_kv_bank_memory(kv_bank, n_layers)
@@ -370,6 +403,12 @@ def compute_retrieval_condition(
                 # ---- Commitment summary (GRU recurrence) ----
                 if not is_last_step:
                     step_hidden = outputs.hidden_states[-1][:, n_prepend:, :]
+
+                    # Mean-pooled hidden state (pre-GRU) for content-addressed retrieval
+                    step_mean = step_hidden.float().mean(dim=1)  # (B, d_model)
+                    current_embedding = step_mean
+                    bank_embeddings.append(step_mean)
+
                     prev_sum = (
                         committed_summaries[-1] if committed_summaries else None
                     )
@@ -409,6 +448,8 @@ def compute_retrieval_condition(
             # Clear bank between sequences
             kv_bank.clear()
             bank_summaries.clear()
+            bank_embeddings.clear()
+            current_embedding = None
 
             n_batches += 1
             if n_batches % 50 == 0:
@@ -516,7 +557,7 @@ def main():
     parser.add_argument("--retrieval-k", type=int, default=2,
                         help="Number of past steps to retrieve")
     parser.add_argument("--retrieval-strategy", type=str, default="recent",
-                        choices=["recent", "all", "similarity"],
+                        choices=["recent", "all", "similarity", "step_embedding"],
                         help="How to select which past steps to retrieve")
     parser.add_argument("--max-bank-size", type=int, default=8,
                         help="Max KV caches stored (evicts oldest)")

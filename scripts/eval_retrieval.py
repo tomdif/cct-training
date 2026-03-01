@@ -265,6 +265,7 @@ def compute_retrieval_condition(
     retrieval_strategy="recent",
     max_bank_size=8,
     config=None,
+    pseudo_select_k=0,
 ):
     """Run one eval condition: process sequences step by step.
 
@@ -273,6 +274,10 @@ def compute_retrieval_condition(
       retrieval_only: use_pseudo_tokens=False, use_kv_retrieval=True
       hybrid:         use_pseudo_tokens=True,  use_kv_retrieval=True
       isolated:       use_pseudo_tokens=False, use_kv_retrieval=False
+
+    pseudo_select_k: if > 0, select top-K summaries by step_embedding
+      similarity for pseudo-token decoding (content-addressed), instead
+      of decoding all prior summaries. KV retrieval stays position-safe.
     """
     model.eval()
     commitment_head.eval()
@@ -325,11 +330,34 @@ def compute_retrieval_condition(
                 if (use_pseudo_tokens and pseudo_decoder is not None
                         and n_prior_steps > 0):
                     P = pseudo_decoder.n_pseudo_tokens
-                    n_prepend = n_prior_steps * P
+
+                    # Select which summaries to decode
+                    if (pseudo_select_k > 0 and n_prior_steps > pseudo_select_k
+                            and current_embedding is not None
+                            and len(bank_embeddings) >= n_prior_steps):
+                        # Content-addressed: top-K by step_embedding similarity
+                        curr = current_embedding[0]  # (d_model,)
+                        sims = []
+                        for i in range(n_prior_steps):
+                            e = bank_embeddings[i][0]  # (d_model,)
+                            cos_sim = F.cosine_similarity(
+                                curr.unsqueeze(0), e.unsqueeze(0)
+                            ).item()
+                            sims.append((i, cos_sim))
+                        sims.sort(key=lambda x: x[1], reverse=True)
+                        selected_indices = sorted(
+                            [idx for idx, _ in sims[:pseudo_select_k]]
+                        )
+                    else:
+                        # Default: decode all prior summaries
+                        selected_indices = list(range(n_prior_steps))
+
+                    n_selected = len(selected_indices)
+                    n_prepend = n_selected * P
                     summary_embeds_list = []
                     summary_pos_list = []
 
-                    for s_idx in range(n_prior_steps):
+                    for s_idx in selected_indices:
                         s = committed_summaries[s_idx]
                         if K > 1:
                             s = s[:, 0, :]
@@ -563,6 +591,9 @@ def main():
                         help="Max KV caches stored (evicts oldest)")
     parser.add_argument("--window-tokens", type=int, default=800,
                         help="Sliding window size in tokens (prior art baseline)")
+    parser.add_argument("--pseudo-select-k", type=int, default=0,
+                        help="Content-addressed pseudo-token selection: top-K summaries "
+                             "by step_embedding similarity (0 = decode all, default)")
     parser.add_argument("--skip-pseudo-only", action="store_true")
     parser.add_argument("--skip-isolated", action="store_true")
     parser.add_argument("--skip-sliding-window", action="store_true")
@@ -707,6 +738,7 @@ def main():
             n_summary_tokens_K=n_summary_tokens,
             use_pseudo_tokens=True, use_kv_retrieval=False,
             config=config,
+            pseudo_select_k=args.pseudo_select_k,
         )
         total = sum(ps_loss.values()) / max(sum(ps_tok.values()), 1)
         print(f"\n  Pseudo-only total: loss={total:.4f} ppl={math.exp(total):.2f}")
@@ -742,8 +774,9 @@ def main():
     print(f"  Peak KV bank memory: {ret_mem:.0f} MB")
 
     # ── Condition 3: Hybrid ──
+    psk_label = f", pseudo_select_k={args.pseudo_select_k}" if args.pseudo_select_k > 0 else ""
     print("\n" + "=" * 60)
-    print(f"CONDITION 3: HYBRID (pseudo + {args.retrieval_strategy}-{args.retrieval_k})")
+    print(f"CONDITION 3: HYBRID (pseudo + {args.retrieval_strategy}-{args.retrieval_k}{psk_label})")
     print("=" * 60)
     hyb_loss, hyb_tok, hyb_n, hyb_mem = compute_retrieval_condition(
         model, commitment_head, pseudo_decoder, embed_layer,
@@ -754,6 +787,7 @@ def main():
         retrieval_strategy=args.retrieval_strategy,
         max_bank_size=args.max_bank_size,
         config=config,
+        pseudo_select_k=args.pseudo_select_k,
     )
     total = sum(hyb_loss.values()) / max(sum(hyb_tok.values()), 1)
     print(f"\n  Hybrid total: loss={total:.4f} ppl={math.exp(total):.2f}")
@@ -821,6 +855,7 @@ def main():
             "retrieval_strategy": args.retrieval_strategy,
             "max_bank_size": args.max_bank_size,
             "window_tokens": args.window_tokens,
+            "pseudo_select_k": args.pseudo_select_k,
         },
         "memory": memory_stats,
         "per_step": {},

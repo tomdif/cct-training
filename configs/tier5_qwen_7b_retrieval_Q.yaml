@@ -1,0 +1,149 @@
+# Run Q: Qwen2.5-7B — KV retrieval in the loop (scaled from Run P)
+# Hardware: 1x A100 80GB (RunPod)
+#
+# Why Qwen over Mistral:
+#   1. Context: 32K native (128K w/ YaRN) — stronger baseline to beat
+#   2. Quality: outperforms Mistral-7B on standard benchmarks — harder target
+#   3. RoPE base 1M: graceful degradation beyond training window, so CCT's
+#      positional immunity is tested against a tougher baseline. If CCT still
+#      shows stable PPL where Qwen's RoPE starts degrading at 128K+, the
+#      result is unassailable.
+#
+# Run P (410M Pythia, 15K steps) validated the architecture:
+#   - Retrieval-in-the-loop training eliminated benefit decay
+#   - Flat +1.6 PPL over sliding window across 4K-10K steps
+#   - Stable at all sequence lengths (2K/4K/8K)
+#   - Content-addressed retrieval variants tested and rejected
+#   - Recent KV + GRU pseudo-tokens is the optimal configuration
+#
+# Trainable param budget:
+#   Pseudo-token decoder: 256→1024→16×3584 = ~59.4M
+#   GRU commitment head: GRUCell(256,256) + projections = ~1.1M
+#   Sufficiency probe: 256→3584→3584 = ~13.8M
+#   Up-project: 256→3584 = ~0.9M
+#   Total trainable: ~75M (~1% of frozen 7.6B)
+#
+# Memory estimate (bf16):
+#   Model weights: 7.6B × 2B = ~15.2 GB
+#   Activations + grad graph: ~6 GB (sequential steps, ~400 tokens each)
+#   Trainable params + Adam: ~1 GB
+#   KV bank (8 steps): ~2.4 GB
+#   Overhead: ~3 GB
+#   Total: ~27.6 GB → fits on A100 80GB with ~52 GB headroom
+
+# MODEL
+base_model: "Qwen/Qwen2.5-7B"
+d_model: 3584
+n_layers: 28
+n_heads: 28
+vocab_size: 152064
+
+# CCT ARCHITECTURE — scaled for deeper model
+d_summary: 256
+d_bottleneck: 512
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — GRU recurrent (proven retention at 410M)
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: true
+last_summary_only: false   # Full bank: all prior summaries, each decoded
+
+# L_conclusion — 200 tokens
+conclusion_n_tokens: 200
+
+# Decoder: MLP sufficiency probe (scaled to d_model)
+decoder_type: "mlp"
+decoder_bottleneck: 3584
+
+# FROZEN MODEL — pseudo-token delivery only
+freeze_base_model: true
+use_pseudo_tokens: true
+n_pseudo_tokens: 16
+pseudo_decoder_hidden: 1024
+
+# KV RETRIEVAL DURING TRAINING — validated at 410M in Run P
+use_kv_retrieval: true
+retrieval_k: 2
+max_kv_bank_size: 8
+
+# Contrastive summary loss — prevents decoder convergence toward neutrality
+contrastive_summary_loss: true
+contrastive_margin: 0.1
+contrastive_weight: 0.5
+
+# No other delivery mechanisms
+summary_logit_bias: false
+summary_adapter: false
+use_kv_prefix: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# No multi-hop loss
+multi_hop_loss: false
+
+# TRAINING
+mode: "finetune"
+total_steps: 30000
+batch_size: 2
+seq_len: 2048
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 3.0e-4
+weight_decay: 0.01
+warmup_steps: 750
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+attn_implementation: "sdpa"    # Qwen supports SDPA natively
+
+# CURRICULUM
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.0
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 5000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "run-Q-qwen-7b-retrieval"
+log_interval: 50
+save_interval: 5000
+save_dir: "./checkpoints-run-Q-qwen-7b"
+results_dir: "./results-run-Q-qwen-7b"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "A100-80GB"
+seed: 42
+deterministic: true

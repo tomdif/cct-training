@@ -501,26 +501,35 @@ def compute_retrieval_condition(
 def format_retrieval_table(results_dict, max_step):
     """Format per-step PPL comparison across all conditions."""
     has_sw = "sliding_window" in results_dict
-    w = 130 if has_sw else 110
+    has_bl = "baseline" in results_dict
+    has_ret = "retrieval_only" in results_dict
+    w = 130
+    if has_bl:
+        w += 24
     lines = []
     lines.append("")
     lines.append("=" * w)
     lines.append("RETRIEVAL CCT: PER-STEP PERPLEXITY COMPARISON")
     lines.append("=" * w)
 
-    hdr1 = (
-        f"  {'Step':>4}  {'Pseudo':>10}  {'Retrieval':>10}  "
-        f"{'Hybrid':>10}  {'Isolated':>10}"
-    )
-    hdr2 = (
-        f"  {'':>4}  {'Only':>10}  {'Only':>10}  "
-        f"{'P+R':>10}  {'(no ctx)':>10}"
-    )
+    hdr1 = f"  {'Step':>4}  {'Pseudo':>10}"
+    hdr2 = f"  {'':>4}  {'Only':>10}"
+    if has_ret:
+        hdr1 += f"  {'Retrieval':>10}"
+        hdr2 += f"  {'Only':>10}"
+    hdr1 += f"  {'Hybrid':>10}  {'Isolated':>10}"
+    hdr2 += f"  {'P+R':>10}  {'(no ctx)':>10}"
     if has_sw:
         hdr1 += f"  {'SlidWin':>10}"
         hdr2 += f"  {'(prior)':>10}"
+    if has_bl:
+        hdr1 += f"  {'Baseline':>10}"
+        hdr2 += f"  {'(full)':>10}"
     hdr1 += f"  {'Hyb-Iso':>10}  {'Hyb-Psd':>10}  {'Hyb-SW':>10}"
     hdr2 += f"  {'benefit':>10}  {'benefit':>10}  {'vs prior':>10}"
+    if has_bl:
+        hdr1 += f"  {'Hyb-BL':>10}  {'Deploy%':>10}"
+        hdr2 += f"  {'vs full':>10}  {'delta':>10}"
     lines.append(hdr1)
     lines.append(hdr2)
     lines.append("-" * w)
@@ -531,18 +540,25 @@ def format_retrieval_table(results_dict, max_step):
         h = ppls.get("hybrid", float('nan'))
         iso = ppls.get("isolated", float('nan'))
         sw = ppls.get("sliding_window", float('nan'))
+        bl = ppls.get("baseline", float('nan'))
 
         hyb_iso = iso - h if not (math.isnan(iso) or math.isnan(h)) else float('nan')
         hyb_psd = p - h if not (math.isnan(p) or math.isnan(h)) else float('nan')
         hyb_sw = sw - h if not (math.isnan(sw) or math.isnan(h)) else float('nan')
+        hyb_bl = bl - h if not (math.isnan(bl) or math.isnan(h)) else float('nan')
+        deploy_pct = ((bl - h) / bl * 100) if not (math.isnan(bl) or math.isnan(h)) and bl > 0 else float('nan')
 
-        row = (
-            f"  {label:>4}  {p:>10.2f}  {r:>10.2f}  "
-            f"{h:>10.2f}  {iso:>10.2f}"
-        )
+        row = f"  {label:>4}  {p:>10.2f}"
+        if has_ret:
+            row += f"  {r:>10.2f}"
+        row += f"  {h:>10.2f}  {iso:>10.2f}"
         if has_sw:
             row += f"  {sw:>10.2f}"
+        if has_bl:
+            row += f"  {bl:>10.2f}"
         row += f"  {hyb_iso:>+10.2f}  {hyb_psd:>+10.2f}  {hyb_sw:>+10.2f}"
+        if has_bl:
+            row += f"  {hyb_bl:>+10.2f}  {deploy_pct:>+10.1f}%"
         return row
 
     for step_idx in range(max_step + 1):
@@ -567,10 +583,17 @@ def format_retrieval_table(results_dict, max_step):
     lines.append("  Hyb-Iso:  positive = hybrid CCT helps over isolation (total benefit)")
     lines.append("  Hyb-Psd:  positive = adding KV retrieval to pseudo-tokens helps")
     lines.append("  Hyb-SW:   positive = hybrid CCT beats plain sliding window (CRITICAL)")
+    if has_bl:
+        lines.append("  Hyb-BL:   positive = hybrid CCT beats full-attention baseline")
+        lines.append("  Deploy%:  positive = CCT improves over vanilla model (honest deployment delta)")
     lines.append("")
     lines.append("  If Hyb-SW > 0: CCT adds genuine value over prior-art sliding window")
     lines.append("  If Hyb-SW ~ 0: retrieved KV = sliding window, pseudo-tokens add nothing")
     lines.append("  If Hyb-SW < 0: plain sliding window beats CCT (bad)")
+    if has_bl:
+        lines.append("  Deploy% > 0: CCT is BETTER than vanilla full attention (rare, means learned compression helps)")
+        lines.append("  Deploy% ~ 0: CCT matches full attention (lossless compression)")
+        lines.append("  Deploy% < 0: CCT loses information vs full attention (expected, minimize this)")
 
     return "\n".join(lines)
 
@@ -599,8 +622,11 @@ def main():
                         help="Content-addressed pseudo-token selection: top-K summaries "
                              "by step_embedding similarity (0 = decode all, default)")
     parser.add_argument("--skip-pseudo-only", action="store_true")
+    parser.add_argument("--skip-retrieval-only", action="store_true")
     parser.add_argument("--skip-isolated", action="store_true")
     parser.add_argument("--skip-sliding-window", action="store_true")
+    parser.add_argument("--include-baseline", action="store_true",
+                        help="Run full-attention baseline on same batch (honest deployment delta)")
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
@@ -754,28 +780,31 @@ def main():
         memory_stats["pseudo_only_peak_kv_mb"] = ps_mem
 
     # ── Condition 2: Retrieval-only ──
-    print("\n" + "=" * 60)
-    print(f"CONDITION 2: RETRIEVAL ONLY ({args.retrieval_strategy}-{args.retrieval_k})")
-    print("=" * 60)
-    ret_loss, ret_tok, ret_n, ret_mem = compute_retrieval_condition(
-        model, commitment_head, pseudo_decoder, embed_layer,
-        make_loader(), step_token_id, device, args.eval_batches,
-        n_summary_tokens_K=n_summary_tokens,
-        use_pseudo_tokens=False, use_kv_retrieval=True,
-        retrieval_k=args.retrieval_k,
-        retrieval_strategy=args.retrieval_strategy,
-        max_bank_size=args.max_bank_size,
-        config=config,
-    )
-    total = sum(ret_loss.values()) / max(sum(ret_tok.values()), 1)
-    print(f"\n  Retrieval-only total: loss={total:.4f} ppl={math.exp(total):.2f}")
-    for si in sorted(ret_loss.keys()):
-        if ret_tok[si] > 0:
-            print(f"    step {si}: ppl={math.exp(ret_loss[si] / ret_tok[si]):.2f} "
-                  f"({ret_tok[si]} tokens)")
-    results_dict["retrieval_only"] = (ret_loss, ret_tok)
-    memory_stats["retrieval_only_peak_kv_mb"] = ret_mem
-    print(f"  Peak KV bank memory: {ret_mem:.0f} MB")
+    if args.skip_retrieval_only:
+        print("\n  Skipping retrieval-only condition")
+    else:
+        print("\n" + "=" * 60)
+        print(f"CONDITION 2: RETRIEVAL ONLY ({args.retrieval_strategy}-{args.retrieval_k})")
+        print("=" * 60)
+        ret_loss, ret_tok, ret_n, ret_mem = compute_retrieval_condition(
+            model, commitment_head, pseudo_decoder, embed_layer,
+            make_loader(), step_token_id, device, args.eval_batches,
+            n_summary_tokens_K=n_summary_tokens,
+            use_pseudo_tokens=False, use_kv_retrieval=True,
+            retrieval_k=args.retrieval_k,
+            retrieval_strategy=args.retrieval_strategy,
+            max_bank_size=args.max_bank_size,
+            config=config,
+        )
+        total = sum(ret_loss.values()) / max(sum(ret_tok.values()), 1)
+        print(f"\n  Retrieval-only total: loss={total:.4f} ppl={math.exp(total):.2f}")
+        for si in sorted(ret_loss.keys()):
+            if ret_tok[si] > 0:
+                print(f"    step {si}: ppl={math.exp(ret_loss[si] / ret_tok[si]):.2f} "
+                      f"({ret_tok[si]} tokens)")
+        results_dict["retrieval_only"] = (ret_loss, ret_tok)
+        memory_stats["retrieval_only_peak_kv_mb"] = ret_mem
+        print(f"  Peak KV bank memory: {ret_mem:.0f} MB")
 
     # ── Condition 3: Hybrid ──
     psk_label = f", pseudo_select_k={args.pseudo_select_k}" if args.pseudo_select_k > 0 else ""
@@ -839,6 +868,23 @@ def main():
                 print(f"    step {si}: ppl={math.exp(sw_loss[si] / sw_tok[si]):.2f} "
                       f"({sw_tok[si]} tokens)")
         results_dict["sliding_window"] = (sw_loss, sw_tok)
+
+    # ── Condition 6: Full-attention baseline (same batch, honest deployment delta) ──
+    if args.include_baseline:
+        print("\n" + "=" * 60)
+        print(f"CONDITION 6: FULL ATTENTION BASELINE (window={seq_len}, no CCT)")
+        print("=" * 60)
+        bl_loss, bl_tok, bl_n = compute_sliding_window(
+            model, make_loader(), step_token_id, device,
+            args.eval_batches, window_tokens=seq_len,
+        )
+        total = sum(bl_loss.values()) / max(sum(bl_tok.values()), 1)
+        print(f"\n  Baseline total: loss={total:.4f} ppl={math.exp(total):.2f}")
+        for si in sorted(bl_loss.keys()):
+            if bl_tok[si] > 0:
+                print(f"    step {si}: ppl={math.exp(bl_loss[si] / bl_tok[si]):.2f} "
+                      f"({bl_tok[si]} tokens)")
+        results_dict["baseline"] = (bl_loss, bl_tok)
 
     # ── Comparison table ──
     max_step = max(

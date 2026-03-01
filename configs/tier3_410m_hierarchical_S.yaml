@@ -1,0 +1,149 @@
+# Run S: Pythia-410M — Hierarchical summary tree (trained, not eval-time only)
+# Hardware: 1x RTX 4060 Ti (desktop)
+#
+# Run P used flat GRU chain for summary accumulation. Eval-time tree
+# (bolted onto Run P checkpoint) showed:
+#   16K: Tree +1.22, GRU +1.13 vs sliding window
+#   32K: Tree +0.98, GRU +0.07 (dead)
+#   64K: Tree +0.44, GRU -3.88 (harmful)
+#
+# But the tree never trained its own summaries — it used Run P's GRU summaries
+# with mean-pool merge at eval time. This run trains with hierarchical_tree
+# from scratch. If trained tree beats eval-time tree, the approach is validated
+# before 7B Run R results come in.
+#
+# Architecture:
+#   Level 0: per-step raw summaries (no GRU recurrence)
+#   Level 1: mean-pool groups of 8 level-0 summaries
+#   Level 2+: mean-pool groups of 8 level-(N-1) summaries
+#   Pseudo-tokens decoded from multi-level selection (~6 summaries)
+#   Retrieved KV from 2 most recent steps (same as Run P)
+#
+# Trainable param budget (smaller than Run P — no GRU):
+#   Pseudo-token decoder: 128→768→16×1024 = ~16.9M
+#   Commitment head (no GRU): 1024→256→128 = ~0.3M
+#   Sufficiency probe: 128→1024→1024 = ~1.2M
+#   Up-project: 128→1024 = ~0.1M
+#   Total trainable: ~18.5M (~4.5% of frozen 410M)
+
+# MODEL
+base_model: "EleutherAI/pythia-410m-deduped"
+d_model: 1024
+n_layers: 24
+n_heads: 16
+vocab_size: 50304
+
+# CCT ARCHITECTURE
+d_summary: 128
+d_bottleneck: 256
+step_length: 400
+step_boundary_mode: "fixed"
+n_summary_tokens: 1
+
+# Sequential training with live gradient routing
+training_mode: "sequential"
+gradient_isolation: "full_detach"
+
+# Commitment head — NO GRU, raw per-step summaries for tree
+use_tanh: false
+use_l2_norm: false
+recurrent_commitment: false    # KEY CHANGE: no GRU
+last_summary_only: false
+
+# HIERARCHICAL SUMMARY TREE — O(log N) depth replaces O(N) GRU chain
+hierarchical_tree: true
+branching_factor: 8
+n_recent_l0: 3
+
+# L_conclusion — 200 tokens
+conclusion_n_tokens: 200
+
+# Decoder: MLP sufficiency probe
+decoder_type: "mlp"
+decoder_bottleneck: 1024
+
+# FROZEN MODEL — pseudo-token delivery only
+freeze_base_model: true
+use_pseudo_tokens: true
+n_pseudo_tokens: 16
+pseudo_decoder_hidden: 768
+
+# KV RETRIEVAL DURING TRAINING — validated in Run P
+use_kv_retrieval: true
+retrieval_k: 2
+max_kv_bank_size: 8
+
+# Contrastive summary loss
+contrastive_summary_loss: true
+contrastive_margin: 0.1
+contrastive_weight: 0.5
+
+# No other delivery mechanisms
+summary_logit_bias: false
+summary_adapter: false
+use_kv_prefix: false
+summary_attn_bias: false
+summary_conditioning: false
+use_lora: false
+
+# No multi-hop loss (requires GRU)
+multi_hop_loss: false
+
+# TRAINING — 15K steps, same as Run P for fair comparison
+mode: "finetune"
+total_steps: 15000
+batch_size: 2
+seq_len: 2048
+gradient_accumulation_steps: 4
+
+optimizer: "adamw"
+learning_rate: 5.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+lr_scheduler: "cosine"
+max_grad_norm: 1.0
+
+mixed_precision: "bf16"
+attn_implementation: "eager"
+
+# CURRICULUM — match Run P
+curriculum:
+  phase1_end: 0.0
+  phase2_end: 0.20
+  phase3_end: 0.40
+
+loss_weights:
+  alpha_start: 1.0
+  alpha_end: 0.5
+  beta_max: 0.5
+  gamma_max: 0.35
+  delta_max: 0.2
+  delta_start: 0.1
+  delta_taper: true
+  aux_std_weight: 0.0
+
+# DATA
+dataset: "HuggingFaceFW/fineweb"
+dataset_streaming: true
+dataset_split: "train"
+validation_dataset: "HuggingFaceFW/fineweb"
+validation_split: "train"
+num_workers: 4
+
+# EVALUATION
+eval_interval: 3000
+eval_steps: 100
+
+# LOGGING
+wandb_project: "cct-training"
+wandb_name: "run-S-410m-hierarchical-tree"
+log_interval: 50
+save_interval: 3000
+save_dir: "./checkpoints-run-S-410m-tree"
+results_dir: "./results-run-S-410m-tree"
+
+# HARDWARE
+gpu_count: 1
+gpu_type: "RTX-4060-Ti"
+seed: 42
+deterministic: true

@@ -304,10 +304,11 @@ def compute_retrieval_condition(
             )
             step_ranges = get_step_ranges(seq_len, boundary_positions)
 
-            committed_summaries = []  # Full list (for GRU recurrence)
-            kv_bank = []              # Stored KV caches (max_bank_size)
-            bank_summaries = []       # Summaries aligned with kv_bank
-            bank_embeddings = []      # Mean-pooled step hidden states (pre-GRU)
+            committed_summaries = []  # Full list (for GRU recurrence, never evicted)
+            kv_bank = []              # Stored KV caches (max_bank_size, evicted)
+            bank_summaries = []       # Summaries aligned with kv_bank (evicted)
+            bank_embeddings = []      # Step embeddings aligned with kv_bank (evicted)
+            all_embeddings = []       # ALL step embeddings (never evicted, for pseudo selection)
             current_embedding = None  # Current step's mean-pooled hidden
 
             for step_idx, (start, end) in enumerate(step_ranges):
@@ -334,12 +335,13 @@ def compute_retrieval_condition(
                     # Select which summaries to decode
                     if (pseudo_select_k > 0 and n_prior_steps > pseudo_select_k
                             and current_embedding is not None
-                            and len(bank_embeddings) >= n_prior_steps):
+                            and len(all_embeddings) >= n_prior_steps):
                         # Content-addressed: top-K by step_embedding similarity
+                        # Uses all_embeddings (never evicted), aligned with committed_summaries
                         curr = current_embedding[0]  # (d_model,)
                         sims = []
                         for i in range(n_prior_steps):
-                            e = bank_embeddings[i][0]  # (d_model,)
+                            e = all_embeddings[i][0]  # (d_model,)
                             cos_sim = F.cosine_similarity(
                                 curr.unsqueeze(0), e.unsqueeze(0)
                             ).item()
@@ -435,7 +437,8 @@ def compute_retrieval_condition(
                     # Mean-pooled hidden state (pre-GRU) for content-addressed retrieval
                     step_mean = step_hidden.float().mean(dim=1)  # (B, d_model)
                     current_embedding = step_mean
-                    bank_embeddings.append(step_mean)
+                    bank_embeddings.append(step_mean)  # evicted with kv_bank
+                    all_embeddings.append(step_mean)   # never evicted, for pseudo selection
 
                     prev_sum = (
                         committed_summaries[-1] if committed_summaries else None
@@ -477,6 +480,7 @@ def compute_retrieval_condition(
             kv_bank.clear()
             bank_summaries.clear()
             bank_embeddings.clear()
+            all_embeddings.clear()
             current_embedding = None
 
             n_batches += 1
